@@ -33,16 +33,6 @@ No browser, Node.js, or JavaScript runtime is required.
 
 No third-party Python packages are required.
 
-## Installation
-
-Download PlutoFetch.py from this repository.
-
-Make sure Python, curl, and FFmpeg are installed.
-
-On Termux:
-
-    pkg install python curl ffmpeg
-
 ## Usage
 
 Download an episode:
@@ -201,4 +191,4 @@ Users are responsible for complying with applicable copyright laws and the strea
 
 ## License
 
-No license has been specified for this project.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
