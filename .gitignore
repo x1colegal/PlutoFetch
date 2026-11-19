@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.part
+*.ts
+*.key
+*.m3u8
+*.mp4
+.env
