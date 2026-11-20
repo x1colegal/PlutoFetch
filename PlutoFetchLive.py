@@ -207,7 +207,24 @@ def playlist_items(text, base):
 
 
 def fetch_segment(p, item, jwt, keys):
-    blob = p.curl(item['url'], jwt=jwt)
+    blob = None
+    for attempt in range(8):
+        if p.STOP.is_set():
+            raise KeyboardInterrupt
+        try:
+            blob = p.curl(item['url'], jwt=jwt)
+            break
+        except RuntimeError as exc:
+            if attempt == 7:
+                raise
+            delay = min(0.5 * (attempt + 1), 3.0)
+            print(
+                f"HLS segment {item['seq']}: download failed "
+                f"(attempt {attempt + 1}/8): {exc}",
+                flush=True
+            )
+            if p.STOP.wait(delay):
+                raise KeyboardInterrupt
     key = item.get('key')
     if key and key['method'] == 'AES-128':
         if not shutil.which('openssl'):
