@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+import PlutoFetchLive as live
 
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -57,8 +58,12 @@ def parse_args():
         description="Pluto TV downloader using curl and FFmpeg."
     )
 
-    p.add_argument("-U", "--url", required=True,
-                   help="Pluto TV episode URL")
+    selection = p.add_mutually_exclusive_group(required=True)
+    selection.add_argument("-U", "--url", help="Pluto TV episode or channel URL")
+    selection.add_argument("-s", "--search", metavar="SERIES", help="Search for a VOD series")
+    selection.add_argument("-sc", "--search-channel", metavar="CHANNEL", help="Search for a live channel")
+    p.add_argument("-l", "--listen-on-ip-family", choices=("4", "6"),
+                   help="Live only: listen on IPv4 or IPv6 (default: both)")
 
     cleanup = p.add_mutually_exclusive_group()
     cleanup.add_argument("-k", action="store_true",
@@ -79,10 +84,12 @@ def parse_args():
     if not 1 <= args.workers <= 32:
         p.error("Workers must be between 1 and 32")
 
-    if urlparse(args.url).hostname not in (
+    if args.url and urlparse(args.url).hostname not in (
         "pluto.tv", "www.pluto.tv"
     ):
-        p.error("Only pluto.tv episode URLs are supported")
+        p.error("Only pluto.tv episode and channel URLs are supported")
+    if args.listen_on_ip_family and (args.search or (args.url and '/episode/' in args.url)):
+        p.error("-l/--listen-on-ip-family can only be used with live TV")
 
     return args
 
@@ -105,8 +112,8 @@ def cleanup(mode):
         shutil.rmtree(WORKDIR, ignore_errors=True)
 
 
-def check_dependencies():
-    for name in ("curl", "ffmpeg"):
+def check_dependencies(is_live=False):
+    for name in (("curl",) if is_live else ("curl", "ffmpeg")):
         if shutil.which(name) is None:
             raise RuntimeError(
                 f"Missing dependency: {name}"
@@ -302,7 +309,7 @@ def curl(url, *, post=None, jwt=None, destination=None):
                 "-H", "Cookie: " + cookie_header
             ]
 
-    if jwt and host == "ipv4.pluto.tv":
+    if jwt and host in ("ipv4.pluto.tv", "api.pluto.tv", "service-channels.clusters.pluto.tv"):
         command += [
             "-H", "Authorization: Bearer " + jwt
         ]
@@ -487,7 +494,7 @@ def start_session():
     return jwt
 
 
-def streaming_url(episode_id, jwt):
+def streaming_url(episode_id, jwt, content_type="vod"):
     query = """
     query StreamingUrl($params: StreamingUrlParams!) {
       streamingUrl(params: $params) {
@@ -523,7 +530,7 @@ def streaming_url(episode_id, jwt):
     params = {
         "appVersion": version,
         "contentId": episode_id,
-        "contentType": "vod",
+        "contentType": content_type,
         "drm": "",
         "drmLevel": "",
         "streamType": "stitcher"
@@ -1030,100 +1037,114 @@ def merge(video, audio, output):
 
 # ---------------- Main ----------------
 
+def classify_url(url):
+    path = urlparse(url).path.rstrip('/')
+    if '/episode/' in path:
+        return 'vod', path.split('/episode/', 1)[1].split('/', 1)[0]
+    for token in ('/live-tv/', '/channel/'):
+        if token in path:
+            return 'live', path.split(token, 1)[1].split('/', 1)[0]
+    raise RuntimeError('URL must identify an episode or a live channel.')
+
+
+def resolve_show_url(url):
+    match = re.fullmatch(r"/[a-z]{2}/shows/([^/]+)/?", urlparse(url).path)
+    if not match:
+        raise RuntimeError("Invalid series URL.")
+    return live.select_episode(sys.modules[__name__], series_id=match.group(1))
+
+
+def resolve_channel_id(value):
+    if re.fullmatch(r'[0-9a-fA-F]{24}', value):
+        return value
+    channels = live.search_channels(sys.modules[__name__], value)
+    exact = [ch for ch in channels if ch['name'].casefold() == value.casefold()]
+    if len(exact) == 1:
+        return exact[0]['id']
+    if channels:
+        return live.pick(prompt, channels, lambda c: f"{c['name']} (Channel {c['number']})")['id']
+    raise RuntimeError('Channel slug could not be resolved. Try -sc.')
+
+
 def main():
     args = parse_args()
     mode = get_cleanup_mode(args)
-
-
     success = False
     interrupted = False
-
+    is_live = bool(args.search_channel)
     try:
-        check_dependencies()
-
-        if WORKDIR.exists():
-            print(f"\nExisting workspace: {WORKDIR}")
-
-        SEGDIR.mkdir(parents=True, exist_ok=True)
-
-        try:
-            os.chmod(WORKDIR, 0o700)
-            os.chmod(SEGDIR, 0o700)
-        except OSError:
-            pass
-
-        print("\nFetching episode metadata...")
-
-        episode = metadata(args.url)
-
-        print(f"Series: {episode['series']}")
-        print(f"Season: {episode['season']}")
-        print(f"Episode: {episode['episode']}")
-        print(f"Title: {episode['title']}")
-
-        output = choose_output(args, episode)
-        if args.output:
-            destination = Path(args.output).expanduser()
-            destination.mkdir(parents=True, exist_ok=True)
-            output = destination / output.name
-
-        if output.exists():
-            answer = prompt(
-                "Output exists. Overwrite? [y/N]: "
-            ).strip().lower()
-
-            if answer != "y":
-                raise RuntimeError("Cancelled.")
-
-        print("\nInitializing session...")
-
+        # Initialize the session before accessing authenticated catalogs.
+        curl('https://pluto.tv/')
         jwt = start_session()
-
-        print("Requesting HLS stream...")
-
-        master = streaming_url(episode["id"], jwt)
-
-        queue, video, audio = prepare_playlists(
-            master, jwt
-        )
-
-        queue.download(jwt, args.workers)
-
-        merge(video, audio, output)
-
-        print("\nDownload completed!")
-        print(f"Output: {output}")
-        print(
-            f"File size: "
-            f"{format_bytes(output.stat().st_size)}"
-        )
-
-        success = True
-
+        ACTIVE_JWT = jwt
+        globals()["ACTIVE_JWT"] = jwt
+        if args.search_channel:
+            chosen = live.pick(prompt, live.search_channels(sys.modules[__name__], args.search_channel),
+                               lambda c: f"{c['name']} (Channel {c['number']})")
+            channel_id = chosen['id']
+            is_live = True
+        else:
+            if args.search:
+                args.url = live.select_episode(sys.modules[__name__], args.search)
+            if re.fullmatch(r"/[a-z]{2}/shows/[^/]+/?", urlparse(args.url).path):
+                args.url = resolve_show_url(args.url)
+            mode_name, item_id = classify_url(args.url)
+            is_live = mode_name == 'live'
+            if is_live:
+                channel_id = resolve_channel_id(item_id)
+        if args.listen_on_ip_family and not is_live:
+            raise RuntimeError('-l/--listen-on-ip-family is only supported with live TV.')
+        check_dependencies(is_live)
+        if is_live:
+            print(f'Live channel: {channel_id}')
+            live.live_loop(sys.modules[__name__], channel_id, jwt, args.listen_on_ip_family)
+            success = True
+        else:
+            if WORKDIR.exists():
+                print(f"\nExisting workspace: {WORKDIR}")
+            SEGDIR.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(WORKDIR, 0o700)
+                os.chmod(SEGDIR, 0o700)
+            except OSError:
+                pass
+            print('\nFetching episode metadata...')
+            episode = metadata(args.url)
+            print(f"Series: {episode['series']}")
+            print(f"Season: {episode['season']}")
+            print(f"Episode: {episode['episode']}")
+            print(f"Title: {episode['title']}")
+            output = choose_output(args, episode)
+            if args.output:
+                destination = Path(args.output).expanduser()
+                destination.mkdir(parents=True, exist_ok=True)
+                output = destination / output.name
+            if output.exists():
+                answer = prompt('Output exists. Overwrite? [y/N]: ').strip().lower()
+                if answer != 'y':
+                    raise RuntimeError('Cancelled.')
+            print('Requesting HLS stream...')
+            master = streaming_url(episode['id'], jwt)
+            queue, video, audio = prepare_playlists(master, jwt, args.include_filler)
+            queue.download(jwt, args.workers)
+            merge(video, audio, output)
+            print('\nDownload completed!')
+            print(f'Output: {output}')
+            print(f'File size: {format_bytes(output.stat().st_size)}')
+            success = True
     except KeyboardInterrupt:
         interrupted = True
-        print("\n\nDownload interrupted by user.")
+        print('\nStopped by user.')
         stop_processes()
-
     except Exception as error:
-        print(f"\nERROR: {error}", file=sys.stderr)
-        print(
-            "Temporary files preserved for troubleshooting.",
-            file=sys.stderr
-        )
-
+        print(f'\nERROR: {error}', file=sys.stderr)
+        if not is_live:
+            print('Temporary files preserved for troubleshooting.', file=sys.stderr)
     finally:
-        # Apply cleanup on success or Ctrl+C.
-        # Keep files on unexpected failures for debugging.
-        if success or interrupted:
+        if not is_live and (success or interrupted):
             cleanup(mode)
-
-    if interrupted:
-        return 130
-
-    return 0 if success else 1
+    return 130 if interrupted else (0 if success else 1)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
-

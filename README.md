@@ -1,123 +1,302 @@
 # PlutoFetch
 
-PlutoFetch is a Python command-line downloader for Pluto TV HLS streams.
+PlutoFetch is an unofficial Python command-line tool for downloading Pluto TV VOD episodes and streaming live Pluto TV channels over local TCP connections.
 
-It uses curl to download media resources and FFmpeg to merge locally downloaded video and audio into MP4 files.
+It uses curl for HTTP requests and HLS segment downloads, supports interactive catalog browsing, and provides a built-in MPEG-TS multiplexer for live streams.
 
-No browser, Node.js, or JavaScript runtime is required.
+Live streaming does not require FFmpeg. FFmpeg is used only for VOD remuxing.
 
 ## Features
 
-- Automatic Pluto TV session initialization
-- Cookies and session tokens stored in memory
-- HLS media downloads using curl
-- Concurrent segment downloads
-- Automatic selection of the highest available video quality
-- Portuguese audio selection when available
-- Original segment filenames displayed during downloads
+### Video on Demand (VOD)
+
+- Download Pluto TV episodes from their URLs
+- Automatically detect VOD episode URLs
+- Open series URLs without specifying an episode
+- Interactive season and episode selection
+- Search for series by name
+- Display numbered search results
+- Select a series from the results
+- Automatically select the highest available video bitrate
+- Select Portuguese audio when available
+- Concurrent HLS segment downloads using curl
+- AES-128 HLS support
 - SHA-256-based temporary filenames
-- Download progress with transferred size, speed, and ETA
+- Download progress with speed, percentage, transferred data and ETA
 - Automatic episode filenames
 - Custom output directories and filenames
-- Automatic detection of certain trailing Pluto TV bumpers
-- Optional inclusion of trailing bumpers
-- Local FFmpeg merging without network downloads
+- Detect and remove certain trailing Pluto TV fillers
+- Optional inclusion of trailing fillers
+- Local FFmpeg remuxing without re-encoding
 - Configurable temporary-file cleanup
 - Ctrl+C interruption handling
+
+### Live TV
+
+- Stream Pluto TV live channels
+- Automatically detect live channel URLs
+- Search for channels by name
+- Display numbered channel search results
+- Interactive channel selection
+- Download live HLS segments using curl
+- Continuously refresh live playlists
+- Support AES-128-encrypted HLS segments
+- Built-in MPEG-TS multiplexing
+- Combine separate H.264 video and AAC audio streams
+- Handle MPEG-TS PAT, PMT, PIDs and continuity counters
+- Stream MPEG-TS over TCP
+- Listen on IPv4, IPv6 or both simultaneously
+- Support multiple connected TCP clients
+- No FFmpeg required for live streaming
+- Stop live streaming with Ctrl+C
 
 ## Requirements
 
 - Python 3
 - curl
-- FFmpeg
-
-No third-party Python packages are required.
+- FFmpeg (VOD only)
+- OpenSSL (for AES-128 HLS decryption when needed)
 
 ## Usage
 
-Download an episode:
+### Download a VOD Episode
 
-    python PlutoFetch.py -U "EPISODE_URL"
+    python PlutoFetch.py -U "https://pluto.tv/br/shows/1550017/episode/69a9d62add687227e1af99b1/"
 
-Choose an output directory:
+PlutoFetch automatically detects the episode and starts the VOD download.
 
-    python PlutoFetch.py -U "EPISODE_URL" -o "/sdcard/Download"
+### Browse a Series by URL
 
-Set a custom filename:
+    python PlutoFetch.py -U "https://pluto.tv/br/shows/1550017/"
 
-    python PlutoFetch.py -U "EPISODE_URL" -n "Episode Name"
+PlutoFetch resolves the series from its URL and opens the season and episode selection menus.
 
-Keep all temporary files:
+There is no need to search for the series manually.
 
-    python PlutoFetch.py -U "EPISODE_URL" -k
+### Search for a Series
 
-Delete only the segments directory:
+    python PlutoFetch.py -s "Bob Esponja"
 
-    python PlutoFetch.py -U "EPISODE_URL" -ds
+Search results are displayed as a numbered list.
 
-Include trailing Pluto TV bumpers:
+Select a series, then choose its season and episode.
 
-    python PlutoFetch.py -U "EPISODE_URL" --include-filler
+### Search for a Live Channel
 
-Use 10 concurrent downloads:
+    python PlutoFetch.py -sc "Nick"
 
-    python PlutoFetch.py -U "EPISODE_URL" -w 10
+PlutoFetch displays matching channels in a numbered list.
+
+Select a channel to begin live streaming.
+
+### Stream a Live Channel by URL
+
+    python PlutoFetch.py -U "https://pluto.tv/br/live-tv/645951c0e94c38000802d2cb"
+
+The URL is automatically recognized as a live channel.
+
+PlutoFetch opens a local TCP MPEG-TS server.
+
+### Live TCP Endpoints
+
+By default, PlutoFetch listens on both:
+
+    tcp://127.0.0.1:1491
+    tcp://[::1]:1491
+
+Multiple clients can connect simultaneously.
+
+All connected clients receive the same live broadcast.
+
+### Listen on IPv4 Only
+
+    python PlutoFetch.py -sc "Nick" -l 4
+
+Endpoint:
+
+    tcp://127.0.0.1:1491
+
+### Listen on IPv6 Only
+
+    python PlutoFetch.py -sc "Nick" -l 6
+
+Endpoint:
+
+    tcp://[::1]:1491
+
+### Listen on Both IPv4 and IPv6
+
+Simply omit the -l argument:
+
+    python PlutoFetch.py -sc "Nick"
+
+The -l / --listen-on-ip-family option is available only for Live TV.
+
+Using this option with VOD produces an error.
 
 ## Command-Line Options
 
 | Option | Description |
 |--------|-------------|
-| -U, --url | Pluto TV episode URL |
-| -o, --output | Output directory |
-| -n, --name | Custom output filename |
-| -w, --workers | Number of concurrent downloads |
-| -k | Keep all temporary files |
-| -ds | Delete segments but keep the workspace |
-| --include-filler | Include trailing Pluto TV bumpers |
-| -h, --help | Display help |
+| `-U` | Pluto TV VOD, series or live channel URL |
+| `-s`, `--search` | Search for a series |
+| `-sc`, `--search-channel` | Search for a live TV channel |
+| `-l`, `--listen-on-ip-family` | Live TCP IP family: 4 or 6 |
+| `-o`, `--output` | VOD output directory |
+| `-n`, `--name` | Custom VOD filename |
+| `-w`, `--workers` | Concurrent download workers |
+| `-k` | Keep temporary files |
+| `-ds` | Delete only the temporary segments directory |
+| `--include-filler` | Include recognized trailing filler clips |
+| `-h`, `--help` | Display help |
 
-## How It Works
+## Automatic URL Detection
 
-1. Retrieves episode metadata.
-2. Initializes a Pluto TV session.
-3. Requests an HLS streaming playlist.
-4. Selects the highest available video quality.
-5. Selects an appropriate audio track.
-6. Checks for recognized trailing Pluto TV bumpers.
-7. Downloads HLS segments and encryption-key resources using curl.
-8. Rewrites playlists to reference local files.
-9. Merges downloaded video and audio using FFmpeg.
-10. Removes temporary files according to the selected cleanup policy.
+PlutoFetch automatically determines the operation based on the supplied URL.
 
-FFmpeg operates on local files only. All network downloads are handled by curl.
+| URL Type | Operation |
+|----------|-----------|
+| VOD episode | Download the episode |
+| Series page | Open season and episode selection |
+| Live TV channel | Start the TCP live stream |
 
-## Download Progress
+Examples:
 
-PlutoFetch displays:
+VOD episode:
 
-- Original segment filename
-- Completed and total resources
-- Percentage completed
-- Downloaded data
-- Average download speed
-- Estimated remaining time
+    https://pluto.tv/br/shows/1550017/episode/69a9d62add687227e1af99b1/
+
+Series:
+
+    https://pluto.tv/br/shows/1550017/
+
+Live channel:
+
+    https://pluto.tv/br/live-tv/645951c0e94c38000802d2cb
+
+## Interactive Search
+
+### Series Search
+
+Use -s to search the Pluto TV series catalog.
+
+Matching series are displayed in a numbered list.
+
+After choosing a series, PlutoFetch displays its available seasons.
+
+After selecting a season, the available episodes are displayed.
+
+The selected episode is then downloaded using the VOD downloader.
+
+### Channel Search
+
+Use -sc to search the Pluto TV channel catalog.
+
+Matching channels are displayed in a numbered list.
+
+After selecting a channel, PlutoFetch starts the live streaming server.
+
+Search results and channel availability depend on the Pluto TV catalog and region.
+
+## Live Streaming Architecture
+
+PlutoFetch retrieves live HLS playlists and downloads new media segments using curl.
+
+When video and audio are delivered separately, the built-in MPEG-TS multiplexer combines them into a single transport stream.
+
+Architecture:
+
+    Pluto TV Live HLS
+           |
+          curl
+           |
+       +---+---+
+       |       |
+     Video    Audio
+       |       |
+       +---+---+
+           |
+    Python MPEG-TS Muxer
+           |
+     MPEG-TS Stream
+           |
+      TCP Broadcast
+           |
+      +----+----+
+      |         |
+    IPv4       IPv6
+      |         |
+    Clients   Clients
+
+The TCP server supports multiple simultaneous connections.
+
+FFmpeg is not used for live streaming.
+
+### MPEG-TS Multiplexing
+
+The built-in multiplexer processes MPEG-TS packets and combines separate H.264 and AAC streams.
+
+It handles:
+
+- Program Association Tables (PAT)
+- Program Map Tables (PMT)
+- Packet identifiers (PIDs)
+- Continuity counters
+- Presentation timestamps (PTS)
+- Decoding timestamps (DTS), when available
+
+Live multiplexing is experimental. Certain stream discontinuities, timestamp changes or unusual HLS layouts may require additional handling.
+
+## VOD Downloading
+
+VOD downloading uses curl to retrieve HLS resources concurrently.
+
+Video and audio resources are downloaded separately when necessary.
+
+Temporary playlists are rewritten to reference local files.
+
+FFmpeg then remuxes the downloaded streams into an MP4 file without re-encoding whenever possible.
+
+### Download Progress
 
 Example:
 
     Downloading 708 resources...
-    [ 42.84%] hls_2400-00033.ts | 305/708 | 385.47 MB | 8.57 MB/s | ETA 00:45
+    [42.84%] hls_2400-00033.ts | 305/708 | 385.47 MB | 8.57 MB/s | ETA 00:45
 
-Download speeds are displayed automatically using B/s, KB/s, MB/s, or GB/s.
+Progress information includes:
 
-The ETA is estimated using the average resource size and download speed.
+- Original HLS segment filename
+- Completed resource count
+- Total resource count
+- Completion percentage
+- Downloaded data
+- Average download speed
+- Estimated remaining time
 
-## Trailing Bumper Detection
+## VOD Output Options
 
-Pluto TV may append promotional clips or ident animations to the end of an episode.
+### Custom Output Directory
 
-PlutoFetch can detect some of these clips by inspecting HLS discontinuities and matching keywords in segment URLs.
+    python PlutoFetch.py -s "Bob Esponja" -o "/sdcard/Download"
 
-Recognized keywords include:
+### Custom Filename
+
+    python PlutoFetch.py -s "Bob Esponja" -n "My Episode"
+
+### Concurrent Downloads
+
+    python PlutoFetch.py -s "Bob Esponja" -w 10
+
+The default number of concurrent workers is 6.
+
+## Trailing Filler Detection
+
+Some Pluto TV episodes contain trailing promotional clips or ident animations.
+
+PlutoFetch can recognize certain trailing segments by inspecting HLS discontinuities and segment URLs.
+
+Keywords include:
 
 - ident
 - filler
@@ -125,70 +304,83 @@ Recognized keywords include:
 - outro
 - endcard
 
-When a recognized trailing bumper is detected, its segments are excluded from the download.
+Recognized trailing filler clips are excluded by default.
 
-Use --include-filler to disable this filtering.
+To include them:
 
-This detection is heuristic and may not identify every promotional clip.
+    python PlutoFetch.py -s "Bob Esponja" --include-filler
+
+Detection is heuristic and may not identify every filler clip.
 
 ## Temporary Files
 
-Temporary resources are stored in:
+Temporary files are stored in:
+
+    $HOME/PlutoFetch/
+
+Downloaded segments are stored in:
 
     $HOME/PlutoFetch/segments/
 
-Downloaded resources use SHA-256-based filenames to prevent filename collisions.
+Temporary resource filenames are generated using SHA-256 hashes.
 
-The original segment filenames are displayed in the terminal.
+This helps prevent filename collisions.
 
-By default, the temporary workspace is removed after successful completion.
+Available cleanup modes:
 
-Cleanup modes:
+| Mode | Behavior |
+|------|----------|
+| Default | Remove the temporary workspace |
+| `-k` | Keep the temporary workspace |
+| `-ds` | Remove only the segments directory |
 
-- Default: delete the entire PlutoFetch workspace.
-- -k: keep all temporary files.
-- -ds: delete only the segments directory.
+The selected cleanup policy also applies to interrupted VOD downloads.
 
-The selected cleanup policy also applies when interrupted with Ctrl+C.
+## Example VOD Output
 
-## Output
-
-The final video is saved as an MP4 file.
-
-By default, output files are saved in the user's home directory.
-
-Use -o to select another directory.
-
-Automatic filenames include:
-
-- Series title
-- Season number
-- Episode number
-- Episode title
-
-Example:
+An automatically generated filename may look like:
 
     Bob Esponja Calça Quadrada - S08E20 - Careta definitiva! - Mundo da Luva, descanse em paz.mp4
 
-Video and audio streams are copied without re-encoding whenever supported.
+The resulting MP4 preserves the original video and audio codecs when stream copying is supported.
+
+## Example Live Output
+
+After selecting a channel:
+
+    Live channel: 645951c0e94c38000802d2cb
+    Selected quality: Highest bitrate (3321280 bps)
+    Listening on tcp://127.0.0.1:1491
+    Listening on tcp://[::1]:1491
+
+    Live: segment 18 | 1.61 MB | clients 1
+    Live: segment 19 | 1.60 MB | clients 1
+    Live: segment 20 | 1.52 MB | clients 1
+
+The clients counter indicates the number of currently connected TCP clients.
 
 ## Limitations
 
-- Pluto TV may change its APIs or streaming infrastructure.
-- Some HLS playlist structures may not be supported.
-- Certain encrypted or DRM-protected streams may not be supported.
-- Automatic session initialization depends on Pluto TV accepting the request.
-- Trailing bumper detection is not guaranteed to recognize every promotional clip.
-- Content availability depends on region and catalog availability.
+- Pluto TV APIs may change without notice.
+- Catalog availability depends on geographic region.
+- Some HLS playlist structures may be unsupported.
+- DRM-protected content is not supported.
+- Live streaming depends on the availability of the source channel.
+- MPEG-TS multiplexing is experimental.
+- Playback quality and compatibility depend on the client.
+- New live clients may need to wait for a decodable video keyframe.
+- Trailing filler detection is not guaranteed to recognize every clip.
 
 ## Disclaimer
 
 PlutoFetch is an independent, unofficial project.
 
-It is not affiliated with, endorsed by, or sponsored by Pluto TV, Paramount, or their subsidiaries.
+It is not affiliated with, endorsed by, or sponsored by Pluto TV, Paramount or their subsidiaries.
 
-Users are responsible for complying with applicable copyright laws and the streaming service's terms of use.
+Users are responsible for complying with applicable copyright laws, licensing requirements and the streaming service's terms of use.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License.
+
+See [LICENSE](LICENSE) for details.
