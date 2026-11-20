@@ -133,7 +133,7 @@ def cleanup(mode):
 
 
 def check_dependencies(is_live=False):
-    for name in (("curl",) if is_live else ("curl", "ffmpeg")):
+    for name in (() if is_live else ("ffmpeg",)):
         if shutil.which(name) is None:
             raise RuntimeError(
                 f"Missing dependency: {name}"
@@ -273,98 +273,202 @@ class MemoryCookies:
 COOKIES = MemoryCookies()
 
 
-# ---------------- curl ----------------
+# ---------------- Python HTTP/1.1 + HTTP/2 ----------------
 
-def parse_http_response(raw):
-    """
-    curl -D - writes HTTP headers before the body.
-    Multiple header blocks may occur after redirects.
-    """
+import ssl
+import httpx
 
-    headers = []
-    remaining = raw
+# Python's SSL implementation uses OpenSSL.
+TLS_CONTEXT = ssl.create_default_context()
 
-    while (
-        remaining.startswith(b"HTTP/")
-        and (b"\r\n\r\n" in remaining
-             or b"\n\n" in remaining)
-    ):
-        if b"\r\n\r\n" in remaining:
-            head, remaining = remaining.split(b"\r\n\r\n", 1)
-        else:
-            head, remaining = remaining.split(b"\n\n", 1)
+HTTP_CLIENT = httpx.Client(
+    http1=True,
+    http2=True,
+    verify=TLS_CONTEXT,
+    follow_redirects=True,
+    timeout=httpx.Timeout(
+        connect=12.0,
+        read=25.0,
+        write=25.0,
+        pool=15.0
+    ),
+    limits=httpx.Limits(
+        max_connections=48,
+        max_keepalive_connections=24,
+        keepalive_expiry=30.0
+    ),
+    headers={
+        "User-Agent": UA,
+        "Accept": "*/*"
+    }
+)
 
-        lines = head.decode(
-            "latin-1", errors="replace"
-        ).splitlines()
-
-        headers.extend(lines)
-
-        # The next bytes may be another header block
-        # or the actual response body.
-        if not remaining.startswith(b"HTTP/"):
-            break
-
-    return headers, remaining
+HTTP_RETRIES = 4
+HTTP_RETRY_CODES = {
+    408, 425, 429, 500, 502, 503, 504
+}
 
 
-def curl(url, *, post=None, jwt=None, destination=None):
-    command = [
-        "curl", "-q",
-        "--silent", "--show-error", "--fail",
-        "--location",
-        "--retry", "3",
-        "--connect-timeout", "20",
-        "-A", UA,
-    ]
+def http_headers(url, jwt=None, post=None):
+    headers = {}
 
     host = (urlparse(url).hostname or "").lower()
 
-    # Cookies are never saved to disk.
     if host == "pluto.tv" or host.endswith(".pluto.tv"):
         cookie_header = COOKIES.header(url)
-
         if cookie_header:
-            command += [
-                "-H", "Cookie: " + cookie_header
-            ]
+            headers["Cookie"] = cookie_header
 
-    if jwt and host in ("ipv4.pluto.tv", "api.pluto.tv", "service-channels.clusters.pluto.tv"):
-        command += [
-            "-H", "Authorization: Bearer " + jwt
-        ]
+    if jwt and host in (
+        "ipv4.pluto.tv",
+        "api.pluto.tv",
+        "service-channels.clusters.pluto.tv"
+    ):
+        headers["Authorization"] = "Bearer " + jwt
 
     if post is not None:
-        command += [
-            "-H", "Content-Type: application/json",
-            "-H", "Origin: https://pluto.tv",
-            "--data-binary", "@-",
-        ]
+        headers["Content-Type"] = "application/json"
+        headers["Origin"] = "https://pluto.tv"
 
-    if destination is None:
-        command += ["-D", "-"]
-    else:
-        partial = Path(str(destination) + ".part")
-        command += ["-o", str(partial)]
+    return headers
 
-    command.append(url)
 
-    if destination is None:
-        raw = run(command, post)
-        headers, body = parse_http_response(raw)
+def update_response_cookies(response):
+    for received in (*response.history, response):
+        host = received.request.url.host or ""
+        values = received.headers.get_list("set-cookie")
 
-        COOKIES.update(headers, host)
-        return body
+        if values:
+            COOKIES.update(
+                ["Set-Cookie: " + value for value in values],
+                host
+            )
 
-    partial = Path(str(destination) + ".part")
 
-    try:
-        run(command, post)
-        partial.replace(destination)
-        return destination.stat().st_size
-    except BaseException:
-        partial.unlink(missing_ok=True)
-        raise
+def http_request(url, *, post=None, jwt=None,
+                 destination=None, return_url=False):
+
+    method = "POST" if post is not None else "GET"
+    headers = http_headers(url, jwt=jwt, post=post)
+
+    partial = (
+        Path(str(destination) + ".part")
+        if destination is not None else None
+    )
+
+    for attempt in range(HTTP_RETRIES):
+        if STOP.is_set():
+            raise KeyboardInterrupt
+
+        try:
+            with HTTP_CLIENT.stream(
+                method,
+                url,
+                headers=headers,
+                content=post,
+            ) as response:
+
+                update_response_cookies(response)
+                response.raise_for_status()
+
+                if return_url:
+                    return str(response.url)
+
+                if partial is None:
+                    chunks = bytearray()
+
+                    for chunk in response.iter_bytes(
+                        chunk_size=262144
+                    ):
+                        if STOP.is_set():
+                            raise KeyboardInterrupt
+                        chunks.extend(chunk)
+
+                    return bytes(chunks)
+
+                partial.parent.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                with partial.open("wb") as output:
+                    for chunk in response.iter_bytes(
+                        chunk_size=262144
+                    ):
+                        if STOP.is_set():
+                            raise KeyboardInterrupt
+
+                        output.write(chunk)
+
+                size = partial.stat().st_size
+                partial.replace(destination)
+                return size
+
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+
+            if code not in HTTP_RETRY_CODES:
+                if partial is not None:
+                    partial.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"HTTP {code} returned by server"
+                ) from exc
+
+            error = f"HTTP {code}"
+
+        except httpx.RequestError as exc:
+            error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        except BaseException:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
+            raise
+
+        if partial is not None:
+            partial.unlink(missing_ok=True)
+
+        if attempt + 1 == HTTP_RETRIES:
+            break
+
+        delay = min(
+            0.5 * (2 ** attempt),
+            4.0
+        )
+
+        if STOP.wait(delay):
+            raise KeyboardInterrupt
+
+    raise RuntimeError(
+        f"HTTP request failed after "
+        f"{HTTP_RETRIES} attempts: {error}"
+    )
+
+
+# Compatibility with existing PlutoFetch modules.
+# This no longer executes the curl binary.
+def curl(url, *, post=None, jwt=None, destination=None):
+    return http_request(
+        url,
+        post=post,
+        jwt=jwt,
+        destination=destination
+    )
+
+
+def http_final_url(url):
+    return http_request(url, return_url=True)
+
+
+def http_protocol(url="https://pluto.tv/"):
+    with HTTP_CLIENT.stream(
+        "GET",
+        url,
+        headers=http_headers(url)
+    ) as response:
+        response.raise_for_status()
+        return response.http_version
 
 
 # ---------------- Metadata ----------------

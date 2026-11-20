@@ -109,10 +109,8 @@ def resolve_series_id(p, public_id):
     if re.fullmatch(r"[0-9a-fA-F]{24}", public_id):
         return public_id
     url = "https://pluto.tv/br/shows/" + public_id + "/"
-    proc = subprocess.run(["curl", "-q", "-sS", "-L", "--fail", "-o", "/dev/null", "-w", "%{url_effective}", url], capture_output=True, text=True)
-    if proc.returncode:
-        raise RuntimeError("Could not resolve series URL: " + proc.stderr.strip())
-    slug = urlparse(proc.stdout.strip()).path.rstrip("/").split("/")[-1]
+    final_url = p.http_final_url(url)
+    slug = urlparse(final_url).path.rstrip("/").split("/")[-1]
     payload = catalog_json(p, "https://api.pluto.tv/v3/vod/categories?includeItems=true\&deviceType=web".replace("\\&", "&").replace("\&", "&"))
     matches = set()
     def visit(obj):
@@ -654,7 +652,7 @@ def live_loop(p, channel_id, jwt, family, port=1491):
             print(
                 f"Live: segment {item['seq']} | "
                 f"{len(block)/1048576:.2f} MB | "
-                f"clients {count} | buffer 5s"
+                f"clients {count} | buffer target 15s"
             )
     finally:
         server.close()
