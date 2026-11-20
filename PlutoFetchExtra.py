@@ -1,0 +1,345 @@
+"""Optional recording and paced VOD streaming for PlutoFetch.
+No external remuxer for live recordings (fragmented MP4 writer).
+"""
+import datetime
+import os
+import re
+import struct
+import threading
+import time
+from pathlib import Path
+
+import PlutoFetchLive as live
+
+
+def box(t, payload=b''):
+    return struct.pack('>I4s', len(payload)+8, t.encode('ascii')) + payload
+
+
+def fullbox(t, version, flags, payload=b''):
+    return box(t, bytes([version]) + flags.to_bytes(3, 'big') + payload)
+
+
+def u16(x): return struct.pack('>H', x)
+def u32(x): return struct.pack('>I', x)
+def i32(x): return struct.pack('>i', x)
+def u64(x): return struct.pack('>Q', x)
+
+
+def h264_nals(blob):
+    starts = [m for m in re.finditer(b'\x00\x00\x01', blob)]
+    result = []
+    for idx, m in enumerate(starts):
+        offset = m.start()+3
+        end = starts[idx+1].start() if idx+1 < len(starts) else len(blob)
+        # When Annex B prefix is 00 00 00 01, the extra zero belongs to trailing bytes.
+        payload = blob[offset:end].rstrip(b'\x00')
+        if payload:
+            result.append(payload)
+    return result
+
+
+def pes_content(pes):
+    if len(pes) < 9 or pes[:3] != b'\x00\x00\x01':
+        return None
+    flags = pes[7]
+    hlen = pes[8]
+    def timestamp(b):
+        return (((b[0] >> 1) & 7) << 30) | (b[1] << 22) | ((b[2] >> 1) << 15) | (b[3] << 7) | (b[4] >> 1)
+    pts = timestamp(pes[9:14]) if flags & 0x80 and len(pes) >= 14 else None
+    dts = timestamp(pes[14:19]) if flags & 0x40 and len(pes) >= 19 else pts
+    return pts, dts, pes[9+hlen:]
+
+
+def pes_packets(ts, pid):
+    current = bytearray()
+    for i in range(0, len(ts)-187, 188):
+        pkt = ts[i:i+188]
+        if pkt[0] != 0x47 or (pkt[1] & 0x80):
+            continue
+        if ((pkt[1] & 31) << 8 | pkt[2]) != pid:
+            continue
+        afc = (pkt[3] >> 4) & 3
+        if afc not in (1,3):
+            continue
+        offset = 4 + (1 + pkt[4] if afc == 3 else 0)
+        if offset >= 188:
+            continue
+        if pkt[1] & 0x40:
+            if current:
+                parsed = pes_content(bytes(current))
+                if parsed:
+                    yield parsed
+            current.clear()
+        current.extend(pkt[offset:])
+    if current:
+        parsed = pes_content(bytes(current))
+        if parsed:
+            yield parsed
+
+
+def parse_adts(payload, pts):
+    frames = []
+    pos = 0
+    while pos + 7 <= len(payload):
+        if payload[pos] != 255 or payload[pos+1] & 0xf0 != 0xf0:
+            pos += 1
+            continue
+        profile = (payload[pos+2] >> 6) & 3
+        sr_index = (payload[pos+2] >> 2) & 15
+        chan = ((payload[pos+2] & 1) << 2) | ((payload[pos+3] >> 6) & 3)
+        length = ((payload[pos+3] & 3) << 11) | (payload[pos+4] << 3) | (payload[pos+5] >> 5)
+        header_len = 7 if payload[pos+1] & 1 else 9
+        if length < header_len or pos+length > len(payload) or sr_index >= 13:
+            break
+        sample_rate = (96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350)[sr_index]
+        config = bytes([((profile+1) << 3) | (sr_index >> 1), ((sr_index & 1) << 7) | (chan << 3)])
+        data = payload[pos+header_len:pos+length]
+        timestamp = pts + len(frames) * (1024 * 90000 // sample_rate)
+        frames.append((timestamp, data, config, sample_rate, chan))
+        pos += length
+    return frames
+
+
+def desc(tag, content):
+    # ISO 14496 descriptor variable-length encoded size
+    size = len(content)
+    encoded = [size & 127]
+    size >>= 7
+    while size:
+        encoded.insert(0, (size & 127) | 128)
+        size >>= 7
+    return bytes([tag] + encoded) + content
+
+
+def esds(config):
+    decspecific = desc(5, config)
+    decoder = desc(4, bytes.fromhex('40150000000000000000000000') + decspecific)
+    es = desc(3, b'\x00\x01\x00' + decoder + desc(6, b'\x02'))
+    return fullbox('esds',0,0,es)
+
+
+def visual_sample_entry(sps, pps, width=1920, height=1080):
+    avcc = bytes([1, sps[1], sps[2], sps[3], 255, 225]) + u16(len(sps)) + sps + bytes([1]) + u16(len(pps)) + pps
+    base = b'\0'*6 + u16(1) + b'\0'*16 + u16(width) + u16(height) + u32(0x00480000)*2 + u32(0) + u16(1)
+    base += bytes([0]) + b'\0'*31 + u16(0x18) + u16(0xffff)
+    return box('avc1',base+box('avcC',avcc))
+
+
+def audio_sample_entry(config, samplerate, channels):
+    base = b'\0'*6 + u16(1) + b'\0'*8 + u16(channels) + u16(16) + u16(0) + u16(0) + u32(samplerate<<16)
+    return box('mp4a',base+esds(config))
+
+
+def trak(track_id, handler, entry, timescale):
+    video = handler == 'vide'
+    tkhd = fullbox('tkhd',0,7, u32(0)*2 + u32(track_id) + u32(0)*2 + b'\0'*8 + u16(0)*2 + u16(0 if video else 256) + u16(0) +
+                   u32(65536)+u32(0)*2 + u32(0)+u32(65536)+u32(0)+u32(0)*2+u32(1073741824)+u32((1920 if video else 0)<<16)+u32((1080 if video else 0)<<16))
+    mdhd = fullbox('mdhd',0,0,u32(0)*2+u32(timescale)+u32(0)+u16(0x55c4)+u16(0))
+    hdlr = fullbox('hdlr',0,0,u32(0)+handler.encode()+b'\0'*12+(b'VideoHandler' if video else b'SoundHandler')+b'\0')
+    media_header = fullbox('vmhd',0,1,b'\0'*8) if video else fullbox('smhd',0,0,b'\0'*4)
+    url = fullbox('url ',0,1)
+    dinf = box('dinf',fullbox('dref',0,0,u32(1)+url))
+    stbl = box('stbl',fullbox('stsd',0,0,u32(1)+entry)+fullbox('stts',0,0,u32(0))+fullbox('stsc',0,0,u32(0))+fullbox('stsz',0,0,u32(0)+u32(0))+fullbox('stco',0,0,u32(0)))
+    return box('trak',tkhd+box('mdia',mdhd+hdlr+box('minf',media_header+dinf+stbl)))
+
+
+def initialization(sps, pps, acfg, rate, channels):
+    ftyp=box('ftyp',b'isom'+u32(0x200)+b'isomiso6avc1mp41')
+    mvhd = fullbox('mvhd',0,0,u32(0)*2+u32(1000)+u32(0)+u32(65536)+u16(256)+u16(0)+b'\0'*8+
+                   u32(65536)+u32(0)*2+u32(0)+u32(65536)+u32(0)+u32(0)*2+u32(1073741824)+b'\0'*24+u32(3))
+    tracks = trak(1,'vide',visual_sample_entry(sps,pps),90000)+trak(2,'soun',audio_sample_entry(acfg,rate,channels),90000)
+    mvex=box('mvex',fullbox('trex',0,0,u32(1)+u32(1)+u32(0)*3)+fullbox('trex',0,0,u32(2)+u32(1)+u32(0)*3))
+    return ftyp+box('moov',mvhd+tracks+mvex)
+
+
+class MP4Writer:
+    """Produces fragmented MP4 from H.264 Annex B / AAC ADTS in MPEG-TS blocks."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.file = self.path.open('wb')
+        self.started = False
+        self.sps = None
+        self.pps = None
+        self.audio_config = None
+        self.rate = 48000
+        self.channels = 2
+        self.sequence = 1
+        self.last_end = {1:0,2:0}
+        self.first_timestamp = None
+
+    def write(self, ts):
+        programs = live.parse_program(ts)
+        vid = next((pid for pid, typ in programs.items() if typ==0x1b),None)
+        aud = next((pid for pid, typ in programs.items() if typ==0x0f),None)
+        if vid is None or aud is None:
+            raise RuntimeError('MP4 recording requires H.264 video and AAC ADTS audio in TS.')
+        video=[]
+        audio=[]
+        for pts,dts,payload in pes_packets(ts,vid):
+            if pts is None or dts is None:
+                continue
+            nals=h264_nals(payload)
+            for nal in nals:
+                typ=nal[0]&31
+                if typ == 7: self.sps=nal
+                if typ == 8: self.pps=nal
+            samples=[nal for nal in nals if nal[0]&31 not in (9,7,8,12)]
+            if not any(nal[0]&31 in (1,5) for nal in samples):
+                continue
+            video.append((dts, pts, b''.join(u32(len(nal))+nal for nal in samples), any(nal[0]&31==5 for nal in samples)))
+        for pts,dts,payload in pes_packets(ts,aud):
+            if pts is None:
+                continue
+            for stamp,data,cfg,rate,channels in parse_adts(payload,pts):
+                self.audio_config=cfg
+                self.rate=rate
+                self.channels=channels
+                audio.append((stamp,stamp,data,True))
+        if not video or not audio:
+            raise RuntimeError('MP4 segment contains no decodable video or audio frames.')
+        if not self.started:
+            if not self.sps or not self.pps or not self.audio_config:
+                raise RuntimeError('MP4 stream is missing SPS, PPS or AAC configuration.')
+            self.file.write(initialization(self.sps,self.pps,self.audio_config,self.rate,self.channels))
+            self.started=True
+        self._fragment(video,audio)
+
+    def _fragment(self, video, audio):
+        all_samples={1:video,2:audio}
+        if self.first_timestamp is None:
+            self.first_timestamp=min(video[0][0],audio[0][0])
+        prepared={}
+        for track,samples in all_samples.items():
+            samples=sorted(samples,key=lambda x:x[0])
+            shift=self.first_timestamp
+            base=max(self.last_end[track],max(0,samples[0][0]-shift))
+            entries=[]
+            step=3000 if track==1 else max(1,round(1024*90000/self.rate))
+            for index,(dts,pts,data,key) in enumerate(samples):
+                duration=max(1,samples[index+1][0]-dts) if index+1<len(samples) else step
+                flag=0x02000000 if key else 0x01010000
+                entries.append((duration,len(data),flag,int(pts-dts),data))
+            self.last_end[track]=base+sum(e[0] for e in entries)
+            prepared[track]=(base,entries)
+        def make_traf(track,offset):
+            base,entries=prepared[track]
+            samples=b''.join(u32(duration)+u32(length)+u32(flag)+i32(cts) for duration,length,flag,cts,_ in entries)
+            return box('traf',fullbox('tfhd',0,0x020000,u32(track))+fullbox('tfdt',1,0,u64(base))+
+                       fullbox('trun',1,0x000f01,u32(len(entries))+i32(offset)+samples))
+        video_payload=b''.join(x[4] for x in prepared[1][1])
+        audio_payload=b''.join(x[4] for x in prepared[2][1])
+        def make_moof(vo,ao):
+            return box('moof',fullbox('mfhd',0,0,u32(self.sequence))+make_traf(1,vo)+make_traf(2,ao))
+        template=make_moof(0,0)
+        v_offset=len(template)+8
+        a_offset=v_offset+len(video_payload)
+        moof=make_moof(v_offset,a_offset)
+        self.file.write(moof)
+        self.file.write(box('mdat',video_payload+audio_payload))
+        self.file.flush()
+        self.sequence+=1
+
+    def close(self):
+        if not self.file.closed:
+            self.file.close()
+
+
+def destination(p, args, suggested):
+    directory=Path(args.output).expanduser() if args.output else p.HOME
+    directory.mkdir(parents=True,exist_ok=True)
+    name=p.filename(args.name or suggested)
+    if name.lower().endswith('.mp4'):
+        name=name[:-4]
+    out=directory/(name+'.mp4')
+    if out.exists() and p.prompt('Output exists. Overwrite? [y/N]: ').strip().lower() != 'y':
+        raise RuntimeError('Cancelled.')
+    return out
+
+
+def _segments(p, video_url, audio_url, jwt, follow):
+    keys={}
+    seen=set()
+    while not p.STOP.is_set():
+        vitems, period=live.playlist_items(p.load_playlist(video_url,jwt),video_url)
+        if not vitems:
+            raise RuntimeError('Empty HLS playlist.')
+        aitems=None
+        if audio_url:
+            aitems,_=live.playlist_items(p.load_playlist(audio_url,jwt),audio_url)
+        if aitems is None:
+            pairs=[(v,None) for v in vitems]
+        else:
+            amap={a['seq']:a for a in aitems}
+            pairs=[(v,amap[v['seq']]) for v in vitems if v['seq'] in amap]
+        if follow and not seen and len(pairs)>3:
+            pairs=pairs[-3:]
+        produced=False
+        for v,a in pairs:
+            mark=(v['seq'],v['url'])
+            if mark in seen: continue
+            if p.STOP.is_set(): return
+            video=live.fetch_segment(p,v,jwt,keys)
+            audio=live.fetch_segment(p,a,jwt,keys) if a else None
+            yield v,video,audio
+            seen.add(mark)
+            produced=True
+        if not follow: return
+        p.STOP.wait(max(.5,min(period/2,3.0)))
+
+
+def record_channel(p, channel_id, jwt, args):
+    url=p.urljoin(p.PLAYOUT_BASE,f'v2/stitch/hls/channel/{channel_id}/master.m3u8')
+    video,audio,quality=p.select_variant(p.load_playlist(url,jwt),url)
+    print('Selected quality:',quality)
+    out=destination(p,args,f'PlutoTV - {channel_id} - {datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S")}')
+    mux=live.TsMuxer()
+    server=live.Broadcaster(args.listen_on_ip_family)
+    writer=MP4Writer(out)
+    count=0
+    try:
+        for item,v,a in _segments(p,video,audio,jwt,True):
+            block=mux.mux(v,a)
+            writer.write(block)
+            server.publish(block)
+            count+=1
+            print(f'Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {len(server.clients)} | recording {out.name}')
+    finally:
+        writer.close()
+        server.close()
+        print('Recording:',out)
+
+
+def vod_stream(p, master, jwt, args, episode, download=None):
+    video,audio,quality=p.select_variant(p.load_playlist(master,jwt),master)
+    print('Selected quality:',quality)
+    mux=live.TsMuxer()
+    server=live.Broadcaster(args.listen_on_ip_family)
+    errors=[]
+    worker=None
+    if download is not None:
+        def task():
+            try: download()
+            except Exception as exc: errors.append(exc)
+        worker=threading.Thread(target=task,daemon=True)
+        worker.start()
+    try:
+        print('VOD TCP stream: waiting for first client...')
+        while not p.STOP.is_set():
+            with server.lock:
+                if server.clients: break
+            p.STOP.wait(.2)
+        next_time=time.monotonic()
+        for item,v,a in _segments(p,video,audio,jwt,False):
+            if p.STOP.is_set():break
+            block=mux.mux(v,a)
+            server.publish(block)
+            print(f'VOD Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {len(server.clients)}')
+            next_time+=item['duration']
+            while not p.STOP.is_set() and time.monotonic()<next_time:
+                p.STOP.wait(min(.1,next_time-time.monotonic()))
+        if worker:
+            worker.join()
+        if errors: raise errors[0]
+    finally:
+        server.close()

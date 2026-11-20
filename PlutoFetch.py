@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import PlutoFetchLive as live
+import PlutoFetchExtra as extra
 
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -65,6 +66,9 @@ def parse_args():
     p.add_argument("-l", "--listen-on-ip-family", choices=("4", "6"),
                    help="Live only: listen on IPv4 or IPv6 (default: both)")
 
+    p.add_argument("--record-live", action="store_true", help="Save Live TV to fragmented MP4 without FFmpeg while broadcasting TCP")
+    p.add_argument("--live-vod", choices=("both", "only"), help="Pace VOD over TCP: both = stream + save MP4, only = stream only")
+
     cleanup = p.add_mutually_exclusive_group()
     cleanup.add_argument("-k", action="store_true",
                          help="Keep all temporary files")
@@ -88,7 +92,9 @@ def parse_args():
         "pluto.tv", "www.pluto.tv"
     ):
         p.error("Only pluto.tv episode and channel URLs are supported")
-    if args.listen_on_ip_family and (args.search or (args.url and '/episode/' in args.url)):
+    if args.record_live and args.live_vod:
+        p.error("--record-live and --live-vod cannot be combined")
+    if args.listen_on_ip_family and not args.live_vod and (args.search or (args.url and '/episode/' in args.url)):
         p.error("-l/--listen-on-ip-family can only be used with live TV")
 
     return args
@@ -1092,12 +1098,19 @@ def main():
             is_live = mode_name == 'live'
             if is_live:
                 channel_id = resolve_channel_id(item_id)
-        if args.listen_on_ip_family and not is_live:
+        if args.record_live and not is_live:
+            raise RuntimeError('--record-live is only supported with Live TV.')
+        if args.live_vod and is_live:
+            raise RuntimeError('--live-vod is only supported with VOD episodes.')
+        if args.listen_on_ip_family and not (is_live or args.live_vod):
             raise RuntimeError('-l/--listen-on-ip-family is only supported with live TV.')
-        check_dependencies(is_live)
+        check_dependencies(is_live or args.live_vod == "only")
         if is_live:
             print(f'Live channel: {channel_id}')
-            live.live_loop(sys.modules[__name__], channel_id, jwt, args.listen_on_ip_family)
+            if args.record_live:
+                extra.record_channel(sys.modules[__name__], channel_id, jwt, args)
+            else:
+                live.live_loop(sys.modules[__name__], channel_id, jwt, args.listen_on_ip_family)
             success = True
         else:
             if WORKDIR.exists():
@@ -1114,6 +1127,24 @@ def main():
             print(f"Season: {episode['season']}")
             print(f"Episode: {episode['episode']}")
             print(f"Title: {episode['title']}")
+            if args.live_vod:
+                master = streaming_url(episode['id'], jwt)
+                def download_original():
+                    output = choose_output(args, episode)
+                    if args.output:
+                        dest = Path(args.output).expanduser()
+                        dest.mkdir(parents=True, exist_ok=True)
+                        output = dest / output.name
+                    if output.exists() and prompt('Output exists. Overwrite? [y/N]: ').strip().lower() != 'y':
+                        raise RuntimeError('Cancelled.')
+                    queue, video, audio = prepare_playlists(master, jwt, args.include_filler)
+                    queue.download(jwt, args.workers)
+                    merge(video, audio, output)
+                    print('VOD saved:', output)
+                extra.vod_stream(sys.modules[__name__], master, jwt, args, episode,
+                                 download_original if args.live_vod == 'both' else None)
+                success = True
+                return 0
             output = choose_output(args, episode)
             if args.output:
                 destination = Path(args.output).expanduser()
