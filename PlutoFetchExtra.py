@@ -258,35 +258,242 @@ def destination(p, args, suggested):
 
 
 def _segments(p, video_url, audio_url, jwt, follow):
-    keys={}
-    seen=set()
-    while not p.STOP.is_set():
-        vitems, period=live.playlist_items(p.load_playlist(video_url,jwt),video_url)
-        if not vitems:
-            raise RuntimeError('Empty HLS playlist.')
-        aitems=None
-        if audio_url:
-            aitems,_=live.playlist_items(p.load_playlist(audio_url,jwt),audio_url)
-        if aitems is None:
-            pairs=[(v,None) for v in vitems]
-        else:
-            amap={a['seq']:a for a in aitems}
-            pairs=[(v,amap[v['seq']]) for v in vitems if v['seq'] in amap]
-        if follow and not seen and len(pairs)>3:
-            pairs=pairs[-3:]
-        produced=False
-        for v,a in pairs:
-            mark=(v['seq'],v['url'])
-            if mark in seen: continue
-            if p.STOP.is_set(): return
-            video=live.fetch_segment(p,v,jwt,keys)
-            audio=live.fetch_segment(p,a,jwt,keys) if a else None
-            yield v,video,audio
-            seen.add(mark)
-            produced=True
-        if not follow: return
-        p.STOP.wait(max(.5,min(period/2,3.0)))
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
 
+    INITIAL_BUFFER = 30.0
+    MIN_AHEAD = 15.0
+    MAX_QUEUED = 60.0
+    POLL_INTERVAL = 0.65
+
+    waiting = deque()
+    seen = set()
+    lock = threading.Condition()
+    stop = threading.Event()
+    finished = threading.Event()
+    failures = []
+    local = threading.local()
+
+    executor = ThreadPoolExecutor(
+        max_workers=10,
+        thread_name_prefix='pluto-hls'
+    )
+
+    def fetch(item):
+        if item is None:
+            return None
+        if not hasattr(local, 'keys'):
+            local.keys = {}
+        return live.fetch_segment(p, item, jwt, local.keys)
+
+    def producer():
+        last_new = time.monotonic()
+        first = True
+        last_queued_seq = None
+
+        try:
+            while not stop.is_set() and not p.STOP.is_set():
+
+                vf = executor.submit(
+                    p.load_playlist, video_url, jwt
+                )
+                af = executor.submit(
+                    p.load_playlist, audio_url, jwt
+                ) if audio_url else None
+
+                vitems, period = live.playlist_items(
+                    vf.result(), video_url
+                )
+
+                if not vitems:
+                    raise RuntimeError(
+                        'Empty HLS video playlist'
+                    )
+
+                if af is not None:
+                    aitems, _ = live.playlist_items(
+                        af.result(), audio_url
+                    )
+                    amap = {
+                        a['seq']: a for a in aitems
+                    }
+                    pairs = [
+                        (v, amap[v['seq']])
+                        for v in vitems
+                        if v['seq'] in amap
+                    ]
+                else:
+                    pairs = [(v, None) for v in vitems]
+
+                if first and follow:
+                    initial = []
+                    seconds = 0.0
+
+                    for pair in reversed(pairs):
+                        initial.append(pair)
+                        seconds += pair[0]['duration']
+
+                        if seconds >= INITIAL_BUFFER + MIN_AHEAD:
+                            break
+
+                    pairs = list(reversed(initial))
+
+                first = False
+                added = False
+
+                for item, audio in pairs:
+                    marker = (item['seq'], item['url'])
+                    if last_queued_seq is not None and item["seq"] <= last_queued_seq:
+                        continue
+
+                    with lock:
+                        queued = sum(
+                            entry[0]['duration']
+                            for entry in waiting
+                        )
+
+                        if queued >= MAX_QUEUED:
+                            break
+
+                        if marker in seen:
+                            continue
+
+                        seen.add(marker)
+                        last_queued_seq = item["seq"]
+
+                        video_future = executor.submit(
+                            fetch, item
+                        )
+                        audio_future = (
+                            executor.submit(fetch, audio)
+                            if audio else None
+                        )
+
+                        waiting.append((
+                            item,
+                            video_future,
+                            audio_future
+                        ))
+
+                        lock.notify_all()
+
+                    added = True
+
+                if added:
+                    last_new = time.monotonic()
+
+                if not follow:
+                    if len(seen) >= len(pairs):
+                        return
+
+                    stop.wait(.15)
+                    continue
+
+                if time.monotonic() - last_new > 60:
+                    raise RuntimeError(
+                        'No new live segments for 60 seconds'
+                    )
+
+                stop.wait(POLL_INTERVAL)
+
+        except Exception as exc:
+            failures.append(exc)
+
+        finally:
+            finished.set()
+            with lock:
+                lock.notify_all()
+
+    thread = threading.Thread(
+        target=producer,
+        name='pluto-playlist',
+        daemon=True
+    )
+    thread.start()
+
+    started = False
+    deadline = None
+
+    try:
+        while not p.STOP.is_set():
+
+            with lock:
+                if failures:
+                    raise failures[0]
+
+                ready = []
+                total = 0.0
+
+                for entry in waiting:
+                    video_done = entry[1].done()
+                    audio_done = (
+                        entry[2] is None
+                        or entry[2].done()
+                    )
+
+                    if not video_done or not audio_done:
+                        break
+
+                    ready.append(entry)
+                    total += entry[0]['duration']
+
+                if not ready:
+                    if finished.is_set() and not waiting:
+                        return
+
+                    lock.wait(timeout=.10)
+                    continue
+
+                head = ready[0]
+                reserve = (
+                    total - head[0]['duration']
+                )
+
+                if not finished.is_set() and (
+                    (not started and total < INITIAL_BUFFER)
+                    or reserve < MIN_AHEAD
+                ):
+                    lock.wait(timeout=.10)
+                    continue
+
+                waiting.popleft()
+                started = True
+
+            item, video_future, audio_future = head
+
+            video = video_future.result()
+            audio = (
+                audio_future.result()
+                if audio_future else None
+            )
+
+            if follow:
+                yield item, video, audio
+                continue
+            if deadline is None:
+                deadline = time.monotonic() - 10.0
+
+            delay = deadline - time.monotonic()
+
+            if delay > 0 and p.STOP.wait(delay):
+                return
+
+            if p.STOP.is_set():
+                return
+
+            yield item, video, audio
+
+            deadline = max(
+                deadline + item['duration'],
+                time.monotonic()
+            )
+
+    finally:
+        stop.set()
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True
+        )
 
 def record_channel(p, channel_id, jwt, args):
     url=p.urljoin(p.PLAYOUT_BASE,f'v2/stitch/hls/channel/{channel_id}/master.m3u8')
@@ -329,15 +536,14 @@ def vod_stream(p, master, jwt, args, episode, download=None):
             with server.lock:
                 if server.clients: break
             p.STOP.wait(.2)
-        next_time=time.monotonic()
         for item,v,a in _segments(p,video,audio,jwt,False):
-            if p.STOP.is_set():break
+            if p.STOP.is_set():
+                break
             block=mux.mux(v,a)
             server.publish(block)
-            print(f'VOD Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {len(server.clients)}')
-            next_time+=item['duration']
-            while not p.STOP.is_set() and time.monotonic()<next_time:
-                p.STOP.wait(min(.1,next_time-time.monotonic()))
+            with server.lock:
+                count=len(server.clients)
+            print(f'VOD Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {count} | buffer 5s')
         if worker:
             worker.join()
         if errors: raise errors[0]

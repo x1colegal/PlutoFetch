@@ -345,6 +345,87 @@ def pes_groups(ts, pid):
     return groups
 
 
+
+def _rebase_ts(self, data):
+    """Rebase MPEG-TS PCR, PTS and DTS to a near-zero clock."""
+    data = bytearray(data)
+    mask = (1 << 33) - 1
+
+    def read_ts(pos):
+        x = data[pos:pos+5]
+        return (((x[0] >> 1) & 7) << 30) | (x[1] << 22) | ((x[2] >> 1) << 15) | (x[3] << 7) | (x[4] >> 1)
+
+    def write_ts(pos, value):
+        value &= mask
+        data[pos] = (data[pos] & 0xf0) | (((value >> 30) & 7) << 1) | 1
+        data[pos+1] = (value >> 22) & 255
+        data[pos+2] = (((value >> 15) & 127) << 1) | 1
+        data[pos+3] = (value >> 7) & 255
+        data[pos+4] = ((value & 127) << 1) | 1
+
+    origin = getattr(self, '_clock_origin', None)
+
+    if origin is None:
+        for i in range(0, len(data), 188):
+            if data[i] != 0x47:
+                continue
+            afc = (data[i+3] >> 4) & 3
+            if afc in (2, 3) and data[i+4] >= 7 and data[i+5] & 0x10:
+                p = i+6
+                origin = (data[p] << 25) | (data[p+1] << 17) | (data[p+2] << 9) | (data[p+3] << 1) | (data[p+4] >> 7)
+                break
+
+        if origin is None:
+            for i in range(0, len(data), 188):
+                if data[i] != 0x47 or not data[i+1] & 0x40:
+                    continue
+                afc = (data[i+3] >> 4) & 3
+                if afc not in (1, 3):
+                    continue
+                p = i+4+(1+data[i+4] if afc == 3 else 0)
+                if p+14 <= i+188 and data[p:p+3] == b'\x00\x00\x01' and data[p+7] & 0x80:
+                    origin = read_ts(p+9)
+                    break
+
+        if origin is None:
+            return bytes(data)
+
+        self._clock_origin = origin
+
+    for i in range(0, len(data), 188):
+        if data[i] != 0x47:
+            continue
+
+        afc = (data[i+3] >> 4) & 3
+
+        if afc in (2, 3) and data[i+4] >= 7 and data[i+5] & 0x10:
+            p = i+6
+            value = (data[p] << 25) | (data[p+1] << 17) | (data[p+2] << 9) | (data[p+3] << 1) | (data[p+4] >> 7)
+            value = (value-origin) & mask
+            data[p] = (value >> 25) & 255
+            data[p+1] = (value >> 17) & 255
+            data[p+2] = (value >> 9) & 255
+            data[p+3] = (value >> 1) & 255
+            data[p+4] = (data[p+4] & 127) | ((value & 1) << 7)
+
+        if not data[i+1] & 0x40 or afc not in (1, 3):
+            continue
+
+        p = i+4+(1+data[i+4] if afc == 3 else 0)
+        if p+14 > i+188 or data[p:p+3] != b'\x00\x00\x01':
+            continue
+
+        flags = data[p+7]
+
+        if flags & 0x80:
+            write_ts(p+9, read_ts(p+9)-origin)
+
+        if flags & 0x40 and p+19 <= i+188:
+            write_ts(p+14, read_ts(p+14)-origin)
+
+    return bytes(data)
+
+
 class TsMuxer:
     def __init__(self):
         self.counters = {0x100: 0, 0x101: 0}
@@ -393,7 +474,32 @@ class TsMuxer:
                     out[3] = (out[3] & 0xf0) | self.counters[target]
                     self.counters[target] = (self.counters[target] + 1) & 15
                 result.extend(out)
-        return bytes(result)
+        return _rebase_ts(self, bytes(result))
+
+
+
+def publish_paced(server, data, duration, stop):
+    """Transmit TS continuously instead of sending one segment in a burst."""
+    chunk = 188 * 70
+    duration = max(0.01, float(duration))
+    size = len(data)
+    start = time.monotonic()
+
+    for pos in range(0, size, chunk):
+        if stop.is_set():
+            return
+
+        deadline = start + duration * pos / size
+        remaining = deadline - time.monotonic()
+
+        if remaining > 0 and stop.wait(remaining):
+            return
+
+        server.publish(data[pos:pos+chunk])
+
+    remaining = start + duration - time.monotonic()
+    if remaining > 0:
+        stop.wait(remaining)
 
 
 class Broadcaster:
@@ -430,7 +536,7 @@ class Broadcaster:
             try:
                 client, addr = listener.accept()
                 client.settimeout(2.0)
-                outgoing = queue.Queue(maxsize=4)
+                outgoing = queue.Queue(maxsize=64)
                 with self.lock:
                     self.clients[client] = outgoing
                 threading.Thread(target=self._sender, args=(client, outgoing), daemon=True).start()
@@ -446,7 +552,20 @@ class Broadcaster:
                 try:
                     block = outgoing.get(timeout=0.5)
                 except queue.Empty:
+                    try:
+                        ready, _, _ = select.select([client], [], [], 0)
+                        if ready:
+                            if not client.recv(1, socket.MSG_PEEK):
+                                break
+                            break
+                    except (OSError, ValueError):
+                        break
                     continue
+                ready, _, _ = select.select([client], [], [], 0)
+                if ready:
+                    if not client.recv(1, socket.MSG_PEEK):
+                        break
+                    break
                 client.sendall(block)
         except OSError:
             pass
@@ -488,51 +607,37 @@ class Broadcaster:
 
 
 def live_loop(p, channel_id, jwt, family):
-    # The verified VOD GraphQL session also supplies the bearer token for the
-    # Pluto playout host. Channel HLS shares the /v2/stitch/hls/channel layout.
-    url = urljoin(p.PLAYOUT_BASE, f'v2/stitch/hls/channel/{channel_id}/master.m3u8')
+    import PlutoFetchExtra as extra
+
+    url = urljoin(
+        p.PLAYOUT_BASE,
+        f'v2/stitch/hls/channel/{channel_id}/master.m3u8'
+    )
     master = p.load_playlist(url, jwt)
     video_url, audio_url, quality = p.select_variant(master, url)
+
     print('Selected quality:', quality)
+
+    server = Broadcaster(family)
     mux = TsMuxer()
-    keys = {}
-    seen = set()
-    last_seen = time.monotonic()
-    with_server = Broadcaster(family)
+
     try:
-        while not p.STOP.is_set():
-            video_items, period = playlist_items(p.load_playlist(video_url, jwt), video_url)
-            if not video_items:
-                raise RuntimeError('Live video playlist is empty.')
-            audio_items = None
-            if audio_url:
-                audio_items, _ = playlist_items(p.load_playlist(audio_url, jwt), audio_url)
-            if audio_items is None:
-                pairs = [(v,None) for v in video_items]
-            else:
-                audio_map = {a['seq']:a for a in audio_items}
-                pairs = [(v,audio_map[v['seq']]) for v in video_items if v['seq'] in audio_map]
-            # Start at live edge with a small latency cushion.
-            if not seen and len(pairs) > 3:
-                pairs = pairs[-3:]
-            emitted = False
-            for v,a in pairs:
-                key = (v['seq'], v['url'])
-                if key in seen:
-                    continue
-                if p.STOP.is_set():
-                    break
-                video = fetch_segment(p, v, jwt, keys)
-                audio = fetch_segment(p, a, jwt, keys) if a else None
-                block = mux.mux(video, audio)
-                with_server.publish(block)
-                seen.add(key)
-                emitted = True
-                print(f"Live: segment {v['seq']} | {len(block) / 1048576:.2f} MB | clients {len(with_server.clients)}")
-            if emitted:
-                last_seen = time.monotonic()
-            if time.monotonic() - last_seen > 45:
-                raise RuntimeError('No new synchronized live segments for 45 seconds.')
-            p.STOP.wait(max(0.5, min(period / 2, 3.0)))
+        for item, video, audio in extra._segments(
+            p, video_url, audio_url, jwt, True
+        ):
+            if p.STOP.is_set():
+                break
+
+            block = mux.mux(video, audio)
+            server.publish(block)
+
+            with server.lock:
+                count = len(server.clients)
+
+            print(
+                f"Live: segment {item['seq']} | "
+                f"{len(block)/1048576:.2f} MB | "
+                f"clients {count} | buffer 5s"
+            )
     finally:
-        with_server.close()
+        server.close()
