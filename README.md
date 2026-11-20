@@ -2,7 +2,7 @@
 
 PlutoFetch is an unofficial Python command-line tool for downloading Pluto TV VOD episodes, streaming Live TV channels over TCP, recording live broadcasts to MP4, and streaming VOD episodes in real time.
 
-It uses curl for HTTP requests and HLS downloads, supports interactive catalog browsing, and includes a built-in MPEG-TS multiplexer and fragmented MP4 writer.
+It uses Python HTTPX with HTTP/1.1 and HTTP/2 support for network requests and HLS downloads, supports interactive catalog browsing, and includes a built-in MPEG-TS multiplexer and fragmented MP4 writer.
 
 **Live TV streaming and recording do not require FFmpeg.** FFmpeg is used only for conventional VOD downloading and remuxing.
 
@@ -16,7 +16,7 @@ It uses curl for HTTP requests and HLS downloads, supports interactive catalog b
 - Display numbered search results
 - Automatically select the highest available video quality
 - Select Portuguese audio when available
-- Concurrent HLS segment downloads
+- Concurrent HLS segment downloads over HTTP/1.1 or HTTP/2
 - AES-128 HLS support
 - Automatic episode filenames
 - Custom output directories and filenames
@@ -33,7 +33,7 @@ It uses curl for HTTP requests and HLS downloads, supports interactive catalog b
 - Search for channels using `-sc`
 - Automatically recognize Live TV URLs
 - Continuously refresh live HLS playlists
-- Download multiple HLS segments concurrently
+- Download multiple HLS segments concurrently over HTTPX
 - Download video and audio segments in parallel
 - Preserve HLS segment ordering
 - Pre-buffer media before streaming
@@ -56,14 +56,68 @@ It uses curl for HTTP requests and HLS downloads, supports interactive catalog b
 - Support multiple TCP clients
 - Use the same TCP endpoints as Live TV
 
+## HTTP Networking
+
+PlutoFetch uses **Python HTTPX instead of the curl executable** for all HTTP requests and HLS media downloads.
+
+### Features
+
+- HTTP/1.1 support
+- HTTP/2 support
+- Automatic protocol negotiation using TLS ALPN
+- Automatic fallback to HTTP/1.1 when HTTP/2 is unavailable
+- TLS with Python's OpenSSL-backed `ssl` module
+- TLS certificate verification
+- Persistent HTTP connections and connection pooling
+- Concurrent HTTP requests and HLS segment downloads
+- HTTP response streaming
+- In-memory cookies
+- Authenticated Pluto TV API requests
+- Retry handling for transient HTTP errors and network failures
+
+### Python Dependency
+
+    httpx[http2]
+
+The `httpx[http2]` extra installs the additional dependencies required for HTTP/2.
+
+HTTPX selects HTTP/2 when supported by the remote server and HTTP/1.1 otherwise.
+
+The internal `curl()` compatibility function in `PlutoFetch.py` calls HTTPX and **does not execute the curl binary**.
+
+### HTTP Timeouts and Retries
+
+The current HTTP client configuration includes:
+
+| Setting | Value |
+|---------|-------|
+| Connect timeout | 12 seconds |
+| Read timeout | 25 seconds |
+| Write timeout | 25 seconds |
+| Connection pool timeout | 15 seconds |
+| Maximum connections | 48 |
+| Maximum keep-alive connections | 24 |
+| Keep-alive expiry | 30 seconds |
+| HTTP request attempts | 4 |
+
+Retryable HTTP status codes include `408`, `425`, `429`, `500`, `502`, `503`, and `504`.
+
+Retries do not guarantee recovery from permanently unavailable HLS segments or expired playlist URLs.
+
+### TLS and OpenSSL
+
+HTTPS connections use Python's `ssl` module backed by OpenSSL.
+
+The OpenSSL command-line utility may still be required for AES-128 HLS decryption. It is separate from the HTTP networking implementation.
+
 ## Requirements
 
 - Python 3
-- curl
+- HTTPX with HTTP/2 support (`httpx[http2]`)
 - FFmpeg (conventional VOD downloading only)
 - OpenSSL (for AES-128 HLS decryption when needed)
 
-No third-party Python packages are required.
+HTTPX and its dependencies are required. Python's TLS implementation uses OpenSSL.
 
 ## Files
 
@@ -309,7 +363,7 @@ Timestamp handling is experimental and may require additional work for unusual H
 
 PlutoFetch includes a Python fragmented MP4 writer.
 
-The writer processes H.264 and AAC carried in MPEG-TS and generates fragmented MP4 data using ISO BMFF structures.
+The writer processes H.264 and AAC carried in MPEG-TS and generates fragmented MP4 data using ISO BMFF structures. Live recordings do not require FFmpeg.
 
 The output is written incrementally while the Live TV channel continues broadcasting over TCP.
 
@@ -330,7 +384,7 @@ Some players may handle unfinished or interrupted recordings differently.
 
 ## VOD Downloading
 
-Conventional VOD mode downloads media resources using curl.
+Conventional VOD mode downloads media resources using Python HTTPX, supporting HTTP/1.1 and HTTP/2.
 
 Video, audio and HLS encryption resources are downloaded to a temporary workspace.
 
