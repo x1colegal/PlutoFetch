@@ -119,6 +119,22 @@ FFmpeg is not used.
 
 Press Ctrl+C to stop the recording.
 
+### Record Live TV Without TCP
+
+Use `--record-live --record-only` to save the channel directly to MP4 without starting any TCP listener.
+
+    python PlutoFetch.py -sc "Nick" --record-live --record-only
+
+With a custom directory and filename:
+
+    python PlutoFetch.py -sc "Nick" --record-live --record-only -o "/sdcard/Movies" -n "Nickelodeon"
+
+This mode downloads the live HLS segments and writes a fragmented MP4 using Python. No FFmpeg or TCP server is used.
+
+Press Ctrl+C to stop recording.
+
+`--record-only` requires `--record-live`.
+
 ### Record Live TV with a Custom Directory and Filename
 
     python PlutoFetch.py -sc "Nick" --record-live -o "/sdcard/Movies" -n "Nickelodeon"
@@ -170,6 +186,21 @@ By default, both IPv4 and IPv6 listeners are enabled:
 
     tcp://127.0.0.1:1491
     tcp://[::1]:1491
+
+### Custom TCP Port
+
+Use `-p` or `--port` to select the TCP listening port.
+
+The default is `1491`. Valid values range from `1` to `65535`.
+
+    python PlutoFetch.py -sc "Nick" -p 16000
+
+The listeners become:
+
+    tcp://127.0.0.1:16000
+    tcp://[::1]:16000
+
+Custom ports work with Live TV, Live recording with TCP, and Live VOD.
 
 ### IPv4 Only
 
@@ -376,6 +407,8 @@ Cleanup options:
 | `-s`, `--search` | Search for a VOD series |
 | `-sc`, `--search-channel` | Search for a live channel |
 | `-l`, `--listen-on-ip-family` | TCP listener family: 4 or 6 |
+| `-p`, `--port` | TCP listening port (default: 1491) |
+| `--record-only` | Record Live TV without opening TCP; requires `--record-live` |
 | `--record-live` | Record Live TV to fragmented MP4 while broadcasting |
 | `--live-vod both` | Stream VOD over TCP and save MP4 |
 | `--live-vod only` | Stream VOD over TCP without saving |

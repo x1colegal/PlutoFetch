@@ -505,7 +505,7 @@ def publish_paced(server, data, duration, stop):
 class Broadcaster:
     """Broadcast each TS block independently; slow clients never block others."""
 
-    def __init__(self, family):
+    def __init__(self, family, port=1491):
         self.clients = {}
         self.lock = threading.Lock()
         self.listeners = []
@@ -518,7 +518,7 @@ class Broadcaster:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     if version == 6:
                         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                    sock.bind(('::1' if version == 6 else '127.0.0.1', 1491))
+                    sock.bind(('::1' if version == 6 else '127.0.0.1', port))
                     sock.listen(16)
                     sock.settimeout(0.5)
                     self.listeners.append(sock)
@@ -526,7 +526,7 @@ class Broadcaster:
                     sock.close()
                     raise
                 threading.Thread(target=self._accept, args=(sock,), daemon=True).start()
-                print('Listening on tcp://' + ('[::1]' if version == 6 else '127.0.0.1') + ':1491')
+                print('Listening on tcp://' + ('[::1]' if version == 6 else '127.0.0.1') + ':' + str(port))
         except Exception:
             self.close()
             raise
@@ -606,7 +606,7 @@ class Broadcaster:
                 pass
 
 
-def live_loop(p, channel_id, jwt, family):
+def live_loop(p, channel_id, jwt, family, port=1491):
     import PlutoFetchExtra as extra
 
     url = urljoin(
@@ -618,7 +618,7 @@ def live_loop(p, channel_id, jwt, family):
 
     print('Selected quality:', quality)
 
-    server = Broadcaster(family)
+    server = Broadcaster(family, port)
     mux = TsMuxer()
 
     try:

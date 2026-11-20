@@ -501,19 +501,21 @@ def record_channel(p, channel_id, jwt, args):
     print('Selected quality:',quality)
     out=destination(p,args,f'PlutoTV - {channel_id} - {datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S")}')
     mux=live.TsMuxer()
-    server=live.Broadcaster(args.listen_on_ip_family)
+    server=None if args.record_only else live.Broadcaster(args.listen_on_ip_family,args.port)
     writer=MP4Writer(out)
     count=0
     try:
         for item,v,a in _segments(p,video,audio,jwt,True):
             block=mux.mux(v,a)
             writer.write(block)
-            server.publish(block)
+            if server is not None:
+                server.publish(block)
             count+=1
-            print(f'Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {len(server.clients)} | recording {out.name}')
+            print(f'Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {(len(server.clients) if server is not None else 0)} | recording {out.name}')
     finally:
         writer.close()
-        server.close()
+        if server is not None:
+            server.close()
         print('Recording:',out)
 
 
@@ -521,7 +523,7 @@ def vod_stream(p, master, jwt, args, episode, download=None):
     video,audio,quality=p.select_variant(p.load_playlist(master,jwt),master)
     print('Selected quality:',quality)
     mux=live.TsMuxer()
-    server=live.Broadcaster(args.listen_on_ip_family)
+    server=live.Broadcaster(args.listen_on_ip_family,args.port)
     errors=[]
     worker=None
     if download is not None:

@@ -66,6 +66,11 @@ def parse_args():
     p.add_argument("-l", "--listen-on-ip-family", choices=("4", "6"),
                    help="Live only: listen on IPv4 or IPv6 (default: both)")
 
+    p.add_argument("-p", "--port", type=int, default=1491,
+                   help="TCP listening port (default: 1491)")
+    p.add_argument("--record-only", action="store_true",
+                   help="Record Live TV without opening a TCP server")
+
     p.add_argument("--record-live", action="store_true", help="Save Live TV to fragmented MP4 without FFmpeg while broadcasting TCP")
     p.add_argument("--live-vod", choices=("both", "only"), help="Pace VOD over TCP: both = stream + save MP4, only = stream only")
 
@@ -84,6 +89,15 @@ def parse_args():
     p.add_argument("-o", "--output", help="Final output directory")
     p.add_argument("--include-filler", action="store_true", help="Include Pluto TV trailing bumpers")
     args = p.parse_args()
+
+    if not 1 <= args.port <= 65535:
+        p.error("Port must be between 1 and 65535")
+
+    if args.record_only and not args.record_live:
+        p.error("--record-only requires --record-live")
+
+    if args.record_only and args.listen_on_ip_family:
+        p.error("-l cannot be used with --record-only")
 
     if not 1 <= args.workers <= 32:
         p.error("Workers must be between 1 and 32")
@@ -1104,13 +1118,15 @@ def main():
             raise RuntimeError('--live-vod is only supported with VOD episodes.')
         if args.listen_on_ip_family and not (is_live or args.live_vod):
             raise RuntimeError('-l/--listen-on-ip-family is only supported with live TV.')
+        if args.port != 1491 and not (is_live or args.live_vod):
+            raise RuntimeError("-p is only supported with Live TV or Live VOD.")
         check_dependencies(is_live or args.live_vod == "only")
         if is_live:
             print(f'Live channel: {channel_id}')
             if args.record_live:
                 extra.record_channel(sys.modules[__name__], channel_id, jwt, args)
             else:
-                live.live_loop(sys.modules[__name__], channel_id, jwt, args.listen_on_ip_family)
+                live.live_loop(sys.modules[__name__], channel_id, jwt, args.listen_on_ip_family, args.port)
             success = True
         else:
             if WORKDIR.exists():
