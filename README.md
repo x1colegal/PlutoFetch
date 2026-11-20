@@ -295,8 +295,8 @@ The current configuration in `PlutoFetchExtra.py` is:
 | Setting | Value |
 |---------|-------|
 | Maximum concurrent HLS workers | 10 |
-| Initial ready-media target | 30 seconds |
-| Minimum queued-media reserve | 15 seconds |
+| Initial ready-media target | 30 seconds (adaptive) |
+| Target queued-media reserve | 15 seconds (non-blocking) |
 | Maximum queued-media target | 60 seconds |
 | Live playlist polling interval | 650 ms |
 
@@ -307,6 +307,16 @@ Segments are transmitted in increasing HLS media-sequence order. Previously queu
 ### Buffering Behavior
 
 PlutoFetch attempts to accumulate enough fully downloaded media before starting transmission.
+
+The initial buffering target is 30 seconds. If the source cannot provide that amount, playback may start with less buffered media after an 8-second startup fallback, provided at least 5 seconds are ready.
+
+The 15-second reserve is a target rather than a mandatory transmission gate. After startup, completed segments can be delivered even when the reserve is below its target.
+
+This prevents the internal buffering policy from indefinitely withholding available media when the source publishes segments slowly.
+
+A delivery watchdog reports when no media has been delivered for 8 seconds, including the number of queued and scheduled segments.
+
+The watchdog reports inactivity but does not automatically reconnect a failed source or TCP client.
 
 For example, with 30 seconds of downloaded content:
 

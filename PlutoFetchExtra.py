@@ -413,6 +413,9 @@ def _segments(p, video_url, audio_url, jwt, follow):
 
     started = False
     deadline = None
+    buffer_started = time.monotonic()
+    last_media = time.monotonic()
+    last_warning = 0.0
 
     try:
         while not p.STOP.is_set():
@@ -441,6 +444,16 @@ def _segments(p, video_url, audio_url, jwt, follow):
                     if finished.is_set() and not waiting:
                         return
 
+                    now = time.monotonic()
+                    if now - last_media >= 8 and now - last_warning >= 8:
+                        print(
+                            f"HLS waiting: {len(waiting)} queued, "
+                            f"{len(seen)} scheduled, "
+                            f"{now-last_media:.1f}s without delivery",
+                            flush=True
+                        )
+                        last_warning = now
+
                     lock.wait(timeout=.10)
                     continue
 
@@ -449,15 +462,22 @@ def _segments(p, video_url, audio_url, jwt, follow):
                     total - head[0]['duration']
                 )
 
-                if not finished.is_set() and (
-                    (not started and total < INITIAL_BUFFER)
-                    or reserve < MIN_AHEAD
-                ):
-                    lock.wait(timeout=.10)
-                    continue
+                # Initial buffering is a target, not a permanent gate.
+                # Do not deadlock when the live HLS window is too short.
+                if not started and not finished.is_set():
+                    elapsed = time.monotonic() - buffer_started
+                    if total < INITIAL_BUFFER and (
+                        elapsed < 8.0 or total < 5.0
+                    ):
+                        lock.wait(timeout=.10)
+                        continue
 
+                # After startup, never hold a completed segment solely
+                # to maintain MIN_AHEAD. That would stall the player
+                # whenever the origin publishes segments late.
                 waiting.popleft()
                 started = True
+                last_media = time.monotonic()
 
             item, video_future, audio_future = head
 
