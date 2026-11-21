@@ -555,7 +555,7 @@ def record_channel(p, channel_id, jwt, args):
             if p.STOP.is_set():
                 break
 
-            remuxer.submit(v, a)
+            remuxer.submit(v, a, item.get("duration", 5.0))
 
             count = 0
             if server is not None:
@@ -631,7 +631,7 @@ def vod_stream(p, master, jwt, args, episode, download=None):
             if p.STOP.is_set():
                 break
 
-            remuxer.submit(v, a)
+            remuxer.submit(v, a, item.get("duration", 5.0))
 
             with server.lock:
                 count = len(server.clients)

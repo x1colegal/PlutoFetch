@@ -631,26 +631,22 @@ class Broadcaster:
                 try:
                     block = outgoing.get(timeout=0.5)
                 except queue.Empty:
-                    try:
-                        ready, _, _ = select.select([client], [], [], 0)
-                        if ready:
-                            if not client.recv(1, socket.MSG_PEEK):
-                                break
-                            break
-                    except (OSError, ValueError):
-                        break
                     continue
-                ready, _, _ = select.select([client], [], [], 0)
-                if ready:
-                    if not client.recv(1, socket.MSG_PEEK):
-                        break
+
+                if block is None:
                     break
+
+                # No select() on a socket that another thread
+                # may have closed (fileno == -1).
                 client.sendall(block)
-        except OSError:
+
+        except (OSError, ValueError):
             pass
+
         finally:
             with self.lock:
                 self.clients.pop(client, None)
+
             try:
                 client.close()
             except OSError:
@@ -701,6 +697,9 @@ class FFmpegTS:
         self.output = output
         self.errors = []
         self.bytes_out = 0
+        self._pace_lock = threading.Lock()
+        self._byte_rate = 640 * 1024
+        self._pace_deadline = None
         self.closed = False
         self.queues = []
         self.threads = []
@@ -825,20 +824,57 @@ class FFmpegTS:
                 self.errors.append(exc)
 
     def _read_output(self):
+        import time
+
         try:
-            while True:
-                block = self.process.stdout.read(188 * 256)
+            while not self.p.STOP.is_set():
+                block = self.process.stdout.read(188 * 128)
+
                 if not block:
                     break
 
-                self.bytes_out += len(block)
+                # Pace FFmpeg stdout instead of bursting the
+                # entire HLS prefetch buffer into the TCP queues.
+                with self._pace_lock:
+                    rate = max(1, self._byte_rate)
+
+                    now = time.monotonic()
+
+                    if self._pace_deadline is None:
+                        self._pace_deadline = now
+
+                    # Allow a small catch-up burst, never an
+                    # unlimited accumulated scheduling debt.
+                    self._pace_deadline = max(
+                        self._pace_deadline,
+                        now - 0.25
+                    )
+
+                    delay = max(
+                        0.0,
+                        self._pace_deadline - now
+                    )
+
+                    self._pace_deadline += len(block) / rate
+
+                if delay and self.p.STOP.wait(delay):
+                    break
 
                 if self.server is not None:
                     self.server.publish(block)
 
+                self.bytes_out += len(block)
+
         except (OSError, ValueError) as exc:
             if not self.p.STOP.is_set():
                 self.errors.append(exc)
+
+        finally:
+            if self.process.poll() is None and not self.closed:
+                print(
+                    "FFmpeg stdout reader stopped",
+                    flush=True
+                )
 
     def check(self):
         if self.errors:
@@ -852,10 +888,27 @@ class FFmpegTS:
                 f"FFmpeg exited unexpectedly: {code}"
             )
 
-    def submit(self, video, audio=None):
+    def submit(self, video, audio=None, duration=5.0):
         import queue
 
+        duration = max(0.1, float(duration))
+        size = len(video) + (len(audio) if audio else 0)
+
+        # Estimate the actual stream bitrate from the
+        # downloaded HLS media and EXTINF duration.
+        measured = size / duration
+
+        with self._pace_lock:
+            if self.bytes_out == 0:
+                self._byte_rate = measured
+            else:
+                self._byte_rate = (
+                    self._byte_rate * 0.75
+                    + measured * 0.25
+                )
+
         blocks = [video]
+
         if len(self.queues) == 2:
             if audio is None:
                 raise RuntimeError(
@@ -941,7 +994,7 @@ def live_loop(p, channel_id, jwt, family, port=1491):
             if p.STOP.is_set():
                 break
 
-            remuxer.submit(video, audio)
+            remuxer.submit(video, audio, item.get("duration", 5.0))
 
             with server.lock:
                 count = len(server.clients)
