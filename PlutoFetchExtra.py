@@ -526,7 +526,7 @@ def record_channel(p, channel_id, jwt, args):
     count=0
     try:
         for item,v,a in _segments(p,video,audio,jwt,True):
-            block=mux.mux(v,a)
+            block=mux.mux(v,a,discontinuity=item.get('discontinuity',False))
             writer.write(block)
             if server is not None:
                 server.publish(block)
@@ -561,7 +561,7 @@ def vod_stream(p, master, jwt, args, episode, download=None):
         for item,v,a in _segments(p,video,audio,jwt,False):
             if p.STOP.is_set():
                 break
-            block=mux.mux(v,a)
+            block=mux.mux(v,a,discontinuity=item.get('discontinuity',False))
             server.publish(block)
             with server.lock:
                 count=len(server.clients)

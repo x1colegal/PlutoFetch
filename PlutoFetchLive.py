@@ -361,10 +361,14 @@ def pes_groups(ts, pid):
 
 
 
-def _rebase_ts(self, data):
-    """Rebase MPEG-TS PCR, PTS and DTS to a near-zero clock."""
+def _rebase_ts(self, data, discontinuity=False):
+    """Normalize PCR/PTS/DTS across HLS ad discontinuities."""
     data = bytearray(data)
     mask = (1 << 33) - 1
+    half = 1 << 32
+
+    def signed_delta(a, b):
+        return ((a - b + half) & mask) - half
 
     def read_ts(pos):
         x = data[pos:pos+5]
@@ -378,74 +382,134 @@ def _rebase_ts(self, data):
         data[pos+3] = (value >> 7) & 255
         data[pos+4] = ((value & 127) << 1) | 1
 
-    origin = getattr(self, '_clock_origin', None)
+    def read_pcr(pos):
+        return (
+            (data[pos] << 25) |
+            (data[pos+1] << 17) |
+            (data[pos+2] << 9) |
+            (data[pos+3] << 1) |
+            (data[pos+4] >> 7)
+        )
 
-    if origin is None:
-        for i in range(0, len(data), 188):
-            if data[i] != 0x47:
-                continue
-            afc = (data[i+3] >> 4) & 3
-            if afc in (2, 3) and data[i+4] >= 7 and data[i+5] & 0x10:
-                p = i+6
-                origin = (data[p] << 25) | (data[p+1] << 17) | (data[p+2] << 9) | (data[p+3] << 1) | (data[p+4] >> 7)
-                break
+    def write_pcr(pos, value):
+        value &= mask
+        data[pos] = (value >> 25) & 255
+        data[pos+1] = (value >> 17) & 255
+        data[pos+2] = (value >> 9) & 255
+        data[pos+3] = (value >> 1) & 255
+        data[pos+4] = (data[pos+4] & 127) | ((value & 1) << 7)
 
-        if origin is None:
-            for i in range(0, len(data), 188):
-                if data[i] != 0x47 or not data[i+1] & 0x40:
-                    continue
-                afc = (data[i+3] >> 4) & 3
-                if afc not in (1, 3):
-                    continue
-                p = i+4+(1+data[i+4] if afc == 3 else 0)
-                if p+14 <= i+188 and data[p:p+3] == b'\x00\x00\x01' and data[p+7] & 0x80:
-                    origin = read_ts(p+9)
-                    break
+    pcr_values = []
+    pes_values = []
 
-        if origin is None:
-            return bytes(data)
-
-        self._clock_origin = origin
-
-    for i in range(0, len(data), 188):
+    for i in range(0, len(data) - 187, 188):
         if data[i] != 0x47:
             continue
 
         afc = (data[i+3] >> 4) & 3
 
-        if afc in (2, 3) and data[i+4] >= 7 and data[i+5] & 0x10:
-            p = i+6
-            value = (data[p] << 25) | (data[p+1] << 17) | (data[p+2] << 9) | (data[p+3] << 1) | (data[p+4] >> 7)
-            value = (value-origin) & mask
-            data[p] = (value >> 25) & 255
-            data[p+1] = (value >> 17) & 255
-            data[p+2] = (value >> 9) & 255
-            data[p+3] = (value >> 1) & 255
-            data[p+4] = (data[p+4] & 127) | ((value & 1) << 7)
+        if (
+            afc in (2, 3)
+            and data[i+4] >= 7
+            and data[i+5] & 0x10
+        ):
+            pcr_values.append(read_pcr(i+6))
 
         if not data[i+1] & 0x40 or afc not in (1, 3):
             continue
 
-        p = i+4+(1+data[i+4] if afc == 3 else 0)
-        if p+14 > i+188 or data[p:p+3] != b'\x00\x00\x01':
+        pos = i + 4 + (1 + data[i+4] if afc == 3 else 0)
+
+        if (
+            pos + 14 > i + 188
+            or data[pos:pos+3] != b"\\x00\\x00\\x01"
+        ):
             continue
 
-        flags = data[p+7]
+        flags = data[pos+7]
+
+        if flags & 0x40 and pos + 19 <= i + 188:
+            pes_values.append(read_ts(pos+14))
+        elif flags & 0x80:
+            pes_values.append(read_ts(pos+9))
+
+    values = pcr_values or pes_values
+
+    if not values:
+        return bytes(data)
+
+    first_raw = values[0]
+    last_raw = values[-1]
+
+    previous_raw = getattr(self, "_last_raw_clock", None)
+    previous_output = getattr(self, "_last_output_clock", None)
+    offset = getattr(self, "_clock_offset", None)
+
+    if offset is None:
+        offset = (90000 - first_raw) & mask
+
+    elif previous_raw is not None and previous_output is not None:
+        jump = signed_delta(first_raw, previous_raw)
+
+        if discontinuity or jump < -90000 or jump > 900000:
+            # Re-anchor the new HLS timeline just after the previous
+            # segment instead of exposing a timestamp reset to OBS.
+            next_output = (previous_output + 9000) & mask
+            offset = (next_output - first_raw) & mask
+
+            print(
+                "HLS clock discontinuity: "
+                f"raw jump {jump / 90000:.3f}s; "
+                "PCR/PTS/DTS normalized",
+                flush=True
+            )
+
+    for i in range(0, len(data) - 187, 188):
+        if data[i] != 0x47:
+            continue
+
+        afc = (data[i+3] >> 4) & 3
+
+        if (
+            afc in (2, 3)
+            and data[i+4] >= 7
+            and data[i+5] & 0x10
+        ):
+            pos = i + 6
+            write_pcr(pos, read_pcr(pos) + offset)
+
+        if not data[i+1] & 0x40 or afc not in (1, 3):
+            continue
+
+        pos = i + 4 + (1 + data[i+4] if afc == 3 else 0)
+
+        if (
+            pos + 14 > i + 188
+            or data[pos:pos+3] != b"\\x00\\x00\\x01"
+        ):
+            continue
+
+        flags = data[pos+7]
 
         if flags & 0x80:
-            write_ts(p+9, read_ts(p+9)-origin)
+            write_ts(pos+9, read_ts(pos+9) + offset)
 
-        if flags & 0x40 and p+19 <= i+188:
-            write_ts(p+14, read_ts(p+14)-origin)
+        if flags & 0x40 and pos + 19 <= i + 188:
+            write_ts(pos+14, read_ts(pos+14) + offset)
+
+    self._clock_offset = offset
+    self._last_raw_clock = last_raw
+    self._last_output_clock = (last_raw + offset) & mask
 
     return bytes(data)
+
 
 
 class TsMuxer:
     def __init__(self):
         self.counters = {0x100: 0, 0x101: 0}
 
-    def mux(self, video, audio=None):
+    def mux(self, video, audio=None, discontinuity=False):
         vs = parse_program(video)
         vp = next(((pid, typ) for pid,typ in vs.items() if typ in (0x1b,0x24,0x02)), None)
         if not vp or vp[1] != 0x1b:
@@ -489,7 +553,7 @@ class TsMuxer:
                     out[3] = (out[3] & 0xf0) | self.counters[target]
                     self.counters[target] = (self.counters[target] + 1) & 15
                 result.extend(out)
-        return _rebase_ts(self, bytes(result))
+        return _rebase_ts(self, bytes(result), discontinuity)
 
 
 
@@ -643,7 +707,10 @@ def live_loop(p, channel_id, jwt, family, port=1491):
             if p.STOP.is_set():
                 break
 
-            block = mux.mux(video, audio)
+            block = mux.mux(
+                video, audio,
+                discontinuity=item.get('discontinuity', False)
+            )
             server.publish(block)
 
             with server.lock:
