@@ -21,11 +21,13 @@ class IPv4Server(ThreadingHTTPServer):
 
 
 class HLSRelay:
-    def __init__(self, p, video_url, audio_url, jwt):
+    def __init__(self, p, video_url, audio_url, jwt, live=True):
         self.p = p
         self.video_url = video_url
         self.audio_url = audio_url
         self.jwt = jwt
+        self.live = live
+        self.live_delay = 15.0
         self.targets = {}
         self.lock = threading.Lock()
 
@@ -197,6 +199,17 @@ class HLSRelay:
                 self.register(absolute, "video/mp2t")
             )
 
+        if self.live and "#EXT-X-ENDLIST" not in result:
+            # Replace any upstream start preference.
+            result = [
+                line for line in result
+                if not line.startswith("#EXT-X-START:")
+            ]
+            result.insert(
+                1,
+                f"#EXT-X-START:TIME-OFFSET=-{self.live_delay:.1f},PRECISE=NO"
+            )
+
         return "\n".join(result) + "\n"
 
     def master(self):
@@ -257,7 +270,7 @@ def run_hls(p, video_url, audio_url, jwt,
                     break
                 continue
 
-        relay = HLSRelay(p, video_url, audio_url, jwt)
+        relay = HLSRelay(p, video_url, audio_url, jwt, live=live)
         process = None
         threads = []
 
@@ -341,6 +354,24 @@ def run_hls(p, video_url, audio_url, jwt,
                 f"[FFmpeg] Starting pipeline #{attempt}",
                 flush=True
             )
+
+            if live:
+                # Prefer the 15-second HLS start position over
+                # a fixed segment count.
+                if "-live_start_index" in command:
+                    i = command.index("-live_start_index")
+                    del command[i:i+2]
+
+                i = command.index("-i")
+                command[i:i] = [
+                    "-prefer_x_start", "1",
+                    "-live_start_index", "-3"
+                ]
+
+                print(
+                    "[HLS] Target delay: 15s behind Live Edge",
+                    flush=True
+                )
 
             process = subprocess.Popen(
                 command,
