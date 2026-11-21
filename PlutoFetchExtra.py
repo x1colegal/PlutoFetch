@@ -515,59 +515,146 @@ def _segments(p, video_url, audio_url, jwt, follow):
             cancel_futures=True
         )
 
+
 def record_channel(p, channel_id, jwt, args):
-    url=p.urljoin(p.PLAYOUT_BASE,f'v2/stitch/hls/channel/{channel_id}/master.m3u8')
-    video,audio,quality=p.select_variant(p.load_playlist(url,jwt),url)
-    print('Selected quality:',quality)
-    out=destination(p,args,f'PlutoTV - {channel_id} - {datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S")}')
-    mux=live.TsMuxer()
-    server=None if args.record_only else live.Broadcaster(args.listen_on_ip_family,args.port)
-    writer=MP4Writer(out)
-    count=0
+    url = p.urljoin(
+        p.PLAYOUT_BASE,
+        f"v2/stitch/hls/channel/{channel_id}/master.m3u8"
+    )
+
+    video, audio, quality = p.select_variant(
+        p.load_playlist(url, jwt), url
+    )
+
+    print("Selected quality:", quality)
+
+    out = destination(
+        p, args,
+        f"PlutoTV - {channel_id} - "
+        f"{datetime.datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
+    )
+
+    server = (
+        None if args.record_only
+        else live.Broadcaster(args.listen_on_ip_family, args.port)
+    )
+
+    remuxer = None
+
     try:
-        for item,v,a in _segments(p,video,audio,jwt,True):
-            block=mux.mux(v,a,discontinuity=item.get('discontinuity',False))
-            writer.write(block)
+        remuxer = live.FFmpegTS(
+            p,
+            separate_audio=audio is not None,
+            server=server,
+            output=out
+        )
+
+        for item, v, a in _segments(
+            p, video, audio, jwt, True
+        ):
+            if p.STOP.is_set():
+                break
+
+            remuxer.submit(v, a)
+
+            count = 0
             if server is not None:
-                server.publish(block)
-            count+=1
-            print(f'Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {(len(server.clients) if server is not None else 0)} | recording {out.name}')
+                with server.lock:
+                    count = len(server.clients)
+
+            print(
+                f"Live: segment {item['seq']} | "
+                f"clients {count} | "
+                f"FFmpeg recording {out.name}",
+                flush=True
+            )
     finally:
-        writer.close()
-        if server is not None:
-            server.close()
-        print('Recording:',out)
+        try:
+            if remuxer is not None:
+                remuxer.close()
+        finally:
+            if server is not None:
+                server.close()
+
+        print("Recording:", out)
+
 
 
 def vod_stream(p, master, jwt, args, episode, download=None):
-    video,audio,quality=p.select_variant(p.load_playlist(master,jwt),master)
-    print('Selected quality:',quality)
-    mux=live.TsMuxer()
-    server=live.Broadcaster(args.listen_on_ip_family,args.port)
-    errors=[]
-    worker=None
+    video, audio, quality = p.select_variant(
+        p.load_playlist(master, jwt), master
+    )
+
+    print("Selected quality:", quality)
+
+    server = live.Broadcaster(
+        args.listen_on_ip_family, args.port
+    )
+
+    errors = []
+    worker = None
+    remuxer = None
+
     if download is not None:
         def task():
-            try: download()
-            except Exception as exc: errors.append(exc)
-        worker=threading.Thread(target=task,daemon=True)
+            try:
+                download()
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(
+            target=task, daemon=True
+        )
         worker.start()
+
     try:
-        print('VOD TCP stream: waiting for first client...')
+        print("VOD TCP stream: waiting for first client...")
+
         while not p.STOP.is_set():
             with server.lock:
-                if server.clients: break
-            p.STOP.wait(.2)
-        for item,v,a in _segments(p,video,audio,jwt,False):
+                if server.clients:
+                    break
+            p.STOP.wait(0.2)
+
+        if p.STOP.is_set():
+            return
+
+        remuxer = live.FFmpegTS(
+            p,
+            separate_audio=audio is not None,
+            server=server
+        )
+
+        for item, v, a in _segments(
+            p, video, audio, jwt, False
+        ):
             if p.STOP.is_set():
                 break
-            block=mux.mux(v,a,discontinuity=item.get('discontinuity',False))
-            server.publish(block)
+
+            remuxer.submit(v, a)
+
             with server.lock:
-                count=len(server.clients)
-            print(f'VOD Live: segment {item["seq"]} | {len(block)/1048576:.2f} MB | clients {count} | buffer 5s')
-        if worker:
+                count = len(server.clients)
+
+            print(
+                f"VOD Live: segment {item['seq']} | "
+                f"clients {count} | "
+                f"FFmpeg TS {remuxer.bytes_out/1048576:.2f} MB",
+                flush=True
+            )
+
+        remuxer.close()
+        remuxer = None
+
+        if worker is not None:
             worker.join()
-        if errors: raise errors[0]
+
+        if errors:
+            raise errors[0]
+
     finally:
-        server.close()
+        try:
+            if remuxer is not None:
+                remuxer.close()
+        finally:
+            server.close()

@@ -685,41 +685,277 @@ class Broadcaster:
                 pass
 
 
+
+
+class FFmpegTS:
+    """HTTPX media segments -> FFmpeg -> MPEG-TS stdout -> TCP."""
+
+    def __init__(self, p, separate_audio, server=None, output=None):
+        import os
+        import queue
+        import subprocess
+        import threading
+
+        self.p = p
+        self.server = server
+        self.output = output
+        self.errors = []
+        self.bytes_out = 0
+        self.closed = False
+        self.queues = []
+        self.threads = []
+
+        self.read_fds = []
+        self.write_fds = []
+
+        count = 2 if separate_audio else 1
+
+        for _ in range(count):
+            r, w = os.pipe()
+            self.read_fds.append(r)
+            self.write_fds.append(w)
+
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-fflags", "+genpts+discardcorrupt",
+            "-dts_delta_threshold", "1",
+        ]
+
+        for fd in self.read_fds:
+            command += [
+                "-thread_queue_size", "512",
+                "-f", "mpegts",
+                "-i", f"pipe:{fd}"
+            ]
+
+        maps = [
+            "-map", "0:v:0",
+            "-map", "1:a:0" if separate_audio else "0:a:0?"
+        ]
+
+        command += maps + [
+            "-c", "copy",
+            "-max_interleave_delta", "2000000",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-mpegts_flags", "+resend_headers",
+            "-f", "mpegts",
+            "pipe:1"
+        ]
+
+        if output is not None:
+            command += maps + [
+                "-c", "copy",
+                "-movflags",
+                "+frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4",
+                "-y", str(output)
+            ]
+
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                pass_fds=tuple(self.read_fds),
+                bufsize=0
+            )
+        except BaseException:
+            for fd in self.read_fds + self.write_fds:
+                os.close(fd)
+            raise
+
+        for fd in self.read_fds:
+            os.close(fd)
+
+        with p.RUNNING_LOCK:
+            p.RUNNING.add(self.process)
+
+        for fd in self.write_fds:
+            q = queue.Queue(maxsize=12)
+            self.queues.append(q)
+
+            thread = threading.Thread(
+                target=self._feed,
+                args=(fd, q),
+                daemon=True
+            )
+            thread.start()
+            self.threads.append(thread)
+
+        self.reader = threading.Thread(
+            target=self._read_output,
+            daemon=True
+        )
+        self.reader.start()
+
+        print(
+            "FFmpeg MPEG-TS remuxer started "
+            f"({count} input pipe(s))",
+            flush=True
+        )
+
+    def _feed(self, fd, q):
+        import os
+
+        try:
+            with os.fdopen(fd, "wb", buffering=0) as pipe:
+                while not self.p.STOP.is_set():
+                    block = q.get()
+
+                    if block is None:
+                        break
+
+                    view = memoryview(block)
+
+                    while view:
+                        written = pipe.write(view)
+                        if written is None or written <= 0:
+                            raise BrokenPipeError(
+                                "FFmpeg input pipe closed"
+                            )
+                        view = view[written:]
+
+        except (OSError, ValueError) as exc:
+            if not self.p.STOP.is_set():
+                self.errors.append(exc)
+
+    def _read_output(self):
+        try:
+            while True:
+                block = self.process.stdout.read(188 * 256)
+                if not block:
+                    break
+
+                self.bytes_out += len(block)
+
+                if self.server is not None:
+                    self.server.publish(block)
+
+        except (OSError, ValueError) as exc:
+            if not self.p.STOP.is_set():
+                self.errors.append(exc)
+
+    def check(self):
+        if self.errors:
+            raise RuntimeError(
+                f"FFmpeg pipeline failed: {self.errors[0]}"
+            )
+
+        code = self.process.poll()
+        if code is not None and not self.closed:
+            raise RuntimeError(
+                f"FFmpeg exited unexpectedly: {code}"
+            )
+
+    def submit(self, video, audio=None):
+        import queue
+
+        blocks = [video]
+        if len(self.queues) == 2:
+            if audio is None:
+                raise RuntimeError(
+                    "Separate audio segment missing"
+                )
+            blocks.append(audio)
+
+        for q, block in zip(self.queues, blocks):
+            while not self.p.STOP.is_set():
+                self.check()
+                try:
+                    q.put(block, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+
+    def close(self):
+        import queue
+        import subprocess
+
+        self.closed = True
+
+        if self.p.STOP.is_set():
+            self.process.terminate()
+        else:
+            for q in self.queues:
+                while self.process.poll() is None:
+                    try:
+                        q.put(None, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+
+            for thread in self.threads:
+                thread.join(timeout=15)
+
+        try:
+            self.process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+
+        self.reader.join(timeout=5)
+        self.process.stdout.close()
+
+        with self.p.RUNNING_LOCK:
+            self.p.RUNNING.discard(self.process)
+
+        if not self.p.STOP.is_set() and self.process.returncode:
+            raise RuntimeError(
+                f"FFmpeg failed with exit code "
+                f"{self.process.returncode}"
+            )
+
+
 def live_loop(p, channel_id, jwt, family, port=1491):
     import PlutoFetchExtra as extra
 
     url = urljoin(
         p.PLAYOUT_BASE,
-        f'v2/stitch/hls/channel/{channel_id}/master.m3u8'
+        f"v2/stitch/hls/channel/{channel_id}/master.m3u8"
     )
-    master = p.load_playlist(url, jwt)
-    video_url, audio_url, quality = p.select_variant(master, url)
 
-    print('Selected quality:', quality)
+    video_url, audio_url, quality = p.select_variant(
+        p.load_playlist(url, jwt), url
+    )
+
+    print("Selected quality:", quality)
 
     server = Broadcaster(family, port)
-    mux = TsMuxer()
+    remuxer = None
 
     try:
+        remuxer = FFmpegTS(
+            p,
+            separate_audio=audio_url is not None,
+            server=server
+        )
+
         for item, video, audio in extra._segments(
             p, video_url, audio_url, jwt, True
         ):
             if p.STOP.is_set():
                 break
 
-            block = mux.mux(
-                video, audio,
-                discontinuity=item.get('discontinuity', False)
-            )
-            server.publish(block)
+            remuxer.submit(video, audio)
 
             with server.lock:
                 count = len(server.clients)
 
             print(
                 f"Live: segment {item['seq']} | "
-                f"{len(block)/1048576:.2f} MB | "
-                f"clients {count} | buffer target 15s"
+                f"HTTPX {len(video)/1048576:.2f} MB | "
+                f"clients {count} | "
+                f"FFmpeg TS {remuxer.bytes_out/1048576:.2f} MB",
+                flush=True
             )
     finally:
-        server.close()
+        try:
+            if remuxer is not None:
+                remuxer.close()
+        finally:
+            server.close()

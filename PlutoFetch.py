@@ -56,7 +56,7 @@ def prompt(message):
 def parse_args():
     p = argparse.ArgumentParser(
         prog=APP,
-        description="Pluto TV downloader using curl and FFmpeg."
+        description="Pluto TV downloader using HTTPX and FFmpeg."
     )
 
     selection = p.add_mutually_exclusive_group(required=True)
@@ -71,7 +71,7 @@ def parse_args():
     p.add_argument("--record-only", action="store_true",
                    help="Record Live TV without opening a TCP server")
 
-    p.add_argument("--record-live", action="store_true", help="Save Live TV to fragmented MP4 without FFmpeg while broadcasting TCP")
+    p.add_argument("--record-live", action="store_true", help="Save Live TV to fragmented MP4 using FFmpeg while broadcasting TCP")
     p.add_argument("--live-vod", choices=("both", "only"), help="Pace VOD over TCP: both = stream + save MP4, only = stream only")
 
     cleanup = p.add_mutually_exclusive_group()
@@ -133,7 +133,7 @@ def cleanup(mode):
 
 
 def check_dependencies(is_live=False):
-    for name in (() if is_live else ("ffmpeg",)):
+    for name in ("ffmpeg",):
         if shutil.which(name) is None:
             raise RuntimeError(
                 f"Missing dependency: {name}"
