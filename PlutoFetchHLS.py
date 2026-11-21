@@ -227,167 +227,351 @@ class HLSRelay:
 
 
 def run_hls(p, video_url, audio_url, jwt,
-            server=None, output=None, live=True):
+            server=None, output=None, live=True,
+            refresh=None):
+    """
+    HTTPX HLS relay -> FFmpeg -> stdout -> local TCP.
 
-    relay = HLSRelay(
-        p, video_url, audio_url, jwt
-    )
+    Live mode supervises the FFmpeg process and recovers from
+    stalled output, stalled media timestamps or unexpected exit.
+    """
+    attempt = 0
+    total_bytes = 0
 
-    process = None
-    reader = None
-    bytes_out = [0]
-    last_output = [time.monotonic()]
-    started = [False]
+    while not p.STOP.is_set():
+        attempt += 1
 
-    try:
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "warning",
-            "-nostdin",
-        ]
+        if attempt > 1 and refresh is not None:
+            try:
+                video_url, audio_url = refresh()
+                print(
+                    "[Recovery] Pluto HLS URLs refreshed",
+                    flush=True
+                )
+            except Exception as exc:
+                print(
+                    f"[Recovery] Playlist refresh failed: {exc}",
+                    flush=True
+                )
+                if p.STOP.wait(3):
+                    break
+                continue
 
-        # Pre-recorded VOD must be transmitted in real time.
-        if not live:
-            command += ["-re"]
+        relay = HLSRelay(p, video_url, audio_url, jwt)
+        process = None
+        threads = []
 
-        command += [
-            "-fflags", "+genpts+discardcorrupt",
-            "-dts_delta_threshold", "10",
-            "-protocol_whitelist",
-            "file,http,https,tcp,tls,crypto,data",
-            "-i", relay.base + "/master.m3u8",
-        ]
+        state = {
+            "bytes": 0,
+            "last_bytes": time.monotonic(),
+            "last_progress": time.monotonic(),
+            "media_us": None,
+            "progress_seen": False,
+            "finished": False,
+            "error": None,
+        }
 
-        maps = [
-            "-map", "0:v:0",
-            "-map", "0:a:0?"
-        ]
+        started_at = time.monotonic()
+        restart_reason = None
 
-        command += maps + [
-            "-c", "copy",
-            "-muxdelay", "0",
-            "-muxpreload", "0",
-            "-mpegts_flags", "+resend_headers",
-            "-flush_packets", "1",
-            "-f", "mpegts",
-            "pipe:1"
-        ]
-
-        if output is not None:
-            command += maps + [
-                "-c", "copy",
-                "-movflags",
-                "+frag_keyframe+empty_moov+default_base_moof",
-                "-f", "mp4",
-                "-y", str(output)
+        try:
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "repeat+level+info",
+                "-nostats",
+                "-stats_period", "2",
+                "-progress", "pipe:2",
+                "-nostdin",
             ]
 
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            bufsize=0
-        )
+            if not live:
+                command += ["-re"]
 
-        with p.RUNNING_LOCK:
-            p.RUNNING.add(process)
+            command += [
+                "-rw_timeout", "10000000",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_on_network_error", "1",
+                "-reconnect_on_http_error", "429,500,502,503,504",
+                "-reconnect_delay_max", "2",
+                "-max_reload", "8",
+                "-m3u8_hold_counters", "8",
+                "-live_start_index", "-3",
+                "-fflags", "+genpts+discardcorrupt",
+                "-dts_delta_threshold", "10",
+                "-protocol_whitelist",
+                "file,http,https,tcp,tls,crypto,data",
+                "-i", relay.base + "/master.m3u8",
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-c", "copy",
+                "-muxdelay", "0",
+                "-muxpreload", "0",
+                "-mpegts_flags", "+resend_headers",
+                "-flush_packets", "1",
+                "-f", "mpegts",
+                "pipe:1",
+            ]
 
-        def forward():
-            try:
-                while True:
-                    data = process.stdout.read(188 * 128)
-                    if not data:
-                        break
+            if output is not None:
+                from pathlib import Path
+                out = Path(output)
 
-                    if not started[0]:
-                        started[0] = True
+                if attempt > 1:
+                    out = out.with_name(
+                        out.stem + f".restart{attempt-1}" + out.suffix
+                    )
+                    print(
+                        f"[Recording] New MP4 part: {out}",
+                        flush=True
+                    )
+
+                command += [
+                    "-map", "0:v:0",
+                    "-map", "0:a:0?",
+                    "-c", "copy",
+                    "-movflags",
+                    "+frag_keyframe+empty_moov+default_base_moof",
+                    "-f", "mp4",
+                    "-y", str(out)
+                ]
+
+            print(
+                f"[FFmpeg] Starting pipeline #{attempt}",
+                flush=True
+            )
+
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+
+            with p.RUNNING_LOCK:
+                p.RUNNING.add(process)
+
+            def forward():
+                try:
+                    while True:
+                        data = process.stdout.read(188 * 128)
+                        if not data:
+                            break
+
+                        state["bytes"] += len(data)
+                        state["last_bytes"] = time.monotonic()
+
+                        if server is not None:
+                            server.publish(data)
+
+                except (OSError, ValueError) as exc:
+                    state["error"] = str(exc)
+
+                finally:
+                    state["finished"] = True
+
+            def ffmpeg_logs():
+                try:
+                    for raw in process.stderr:
+                        line = raw.decode(
+                            "utf-8", errors="replace"
+                        ).strip()
+
+                        if not line:
+                            continue
+
+                        if line.startswith("out_time_us="):
+                            try:
+                                value = int(line.split("=", 1)[1])
+                            except ValueError:
+                                continue
+
+                            old = state["media_us"]
+
+                            if old is None or value > old:
+                                state["last_progress"] = (
+                                    time.monotonic()
+                                )
+
+                            state["media_us"] = value
+                            state["progress_seen"] = True
+                            continue
+
+                        if line.startswith("out_time_ms="):
+                            if state["progress_seen"]:
+                                continue
+                            try:
+                                value = int(line.split("=", 1)[1])
+                            except ValueError:
+                                continue
+                            old = state["media_us"]
+                            if old is None or value > old:
+                                state["last_progress"] = (
+                                    time.monotonic()
+                                )
+                            state["media_us"] = value
+                            continue
+
+                        if line.startswith((
+                            "frame=",
+                            "fps=",
+                            "stream_",
+                            "bitrate=",
+                            "total_size=",
+                            "out_time=",
+                            "dup_frames=",
+                            "drop_frames=",
+                            "speed=",
+                            "progress=",
+                        )):
+                            continue
+
+                        print("[FFmpeg] " + line, flush=True)
+
+                except (OSError, ValueError) as exc:
+                    if not p.STOP.is_set():
                         print(
-                            "FFmpeg HLS -> MPEG-TS stdout active",
+                            f"[FFmpeg stderr] {exc}",
                             flush=True
                         )
 
-                    bytes_out[0] += len(data)
-                    last_output[0] = time.monotonic()
+            for target, name in (
+                (forward, "pluto-ts-forward"),
+                (ffmpeg_logs, "pluto-ffmpeg-logs")
+            ):
+                thread = threading.Thread(
+                    target=target,
+                    name=name,
+                    daemon=True
+                )
+                thread.start()
+                threads.append(thread)
 
+            last_report = 0.0
+
+            while not p.STOP.is_set():
+                now = time.monotonic()
+                code = process.poll()
+
+                if now - last_report >= 5:
+                    last_report = now
+
+                    clients = 0
                     if server is not None:
-                        server.publish(data)
+                        with server.lock:
+                            clients = len(server.clients)
 
-            except (OSError, ValueError) as exc:
-                if not p.STOP.is_set():
+                    media = state["media_us"]
+                    media_text = (
+                        f"{media / 1000000:.1f}s"
+                        if media is not None else "--"
+                    )
+
                     print(
-                        f"FFmpeg stdout error: {exc}",
+                        f"[Live] clients {clients} | "
+                        f"TS {state['bytes']/1048576:.2f} MB | "
+                        f"media {media_text} | "
+                        f"no output "
+                        f"{now-state['last_bytes']:.1f}s | "
+                        f"FFmpeg #{attempt}",
                         flush=True
                     )
 
-        reader = threading.Thread(
-            target=forward,
-            daemon=True,
-            name="pluto-ffmpeg-stdout"
-        )
-        reader.start()
+                if code is not None:
+                    if not live and code == 0:
+                        restart_reason = None
+                    else:
+                        restart_reason = (
+                            f"FFmpeg exited (code {code})"
+                        )
+                    break
+
+                startup = now - started_at
+
+                if state["bytes"] == 0:
+                    if startup >= 35:
+                        restart_reason = (
+                            "FFmpeg startup timeout (35s)"
+                        )
+                        break
+                else:
+                    if now - state["last_bytes"] >= 20:
+                        restart_reason = (
+                            "MPEG-TS output stalled for 20s"
+                        )
+                        break
+
+                    if (
+                        state["progress_seen"]
+                        and now - state["last_progress"] >= 20
+                    ):
+                        restart_reason = (
+                            "FFmpeg media clock stalled for 20s"
+                        )
+                        break
+
+                if state["error"]:
+                    restart_reason = (
+                        "stdout failure: " + state["error"]
+                    )
+                    break
+
+                p.STOP.wait(0.25)
+
+            total_bytes += state["bytes"]
+
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+
+                try:
+                    process.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+                for thread in threads:
+                    thread.join(timeout=3)
+
+                process.stdout.close()
+                process.stderr.close()
+
+                with p.RUNNING_LOCK:
+                    p.RUNNING.discard(process)
+
+            relay.close()
+
+        if p.STOP.is_set():
+            break
+
+        if restart_reason is None:
+            if live:
+                restart_reason = "Live FFmpeg ended"
+            else:
+                return total_bytes
 
         print(
-            "FFmpeg reading HLS playlist:",
-            relay.base + "/master.m3u8",
+            f"[Recovery] {restart_reason}",
             flush=True
         )
 
-        last_warning = 0.0
+        if not live:
+            raise RuntimeError(restart_reason)
 
-        while not p.STOP.is_set():
-            code = process.poll()
+        # Reset the player's demuxer. Keep TCP listeners alive.
+        if server is not None:
+            server.close_clients()
 
-            if code is not None:
-                reader.join(timeout=3)
+        print(
+            "[Recovery] Restarting FFmpeg and HLS relay",
+            flush=True
+        )
 
-                if code != 0:
-                    raise RuntimeError(
-                        f"FFmpeg HLS exited with code {code}"
-                    )
+        if p.STOP.wait(2):
+            break
 
-                if live:
-                    raise RuntimeError(
-                        "FFmpeg HLS ended unexpectedly during Live TV"
-                    )
+    return total_bytes
 
-                break
-
-            now = time.monotonic()
-
-            if now - last_output[0] >= 15:
-                if now - last_warning >= 15:
-                    print(
-                        "FFmpeg HLS waiting for media: "
-                        f"{now-last_output[0]:.1f}s "
-                        "without MPEG-TS output",
-                        flush=True
-                    )
-                    last_warning = now
-
-            p.STOP.wait(0.25)
-
-        return bytes_out[0]
-
-    finally:
-        if process is not None:
-            if process.poll() is None:
-                process.terminate()
-
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-
-            if reader is not None:
-                reader.join(timeout=3)
-
-            if process.stdout is not None:
-                process.stdout.close()
-
-            with p.RUNNING_LOCK:
-                p.RUNNING.discard(process)
-
-        relay.close()

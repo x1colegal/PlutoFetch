@@ -553,7 +553,10 @@ def record_channel(p, channel_id, jwt, args):
             jwt,
             server=server,
             output=out,
-            live=True
+            live=True,
+            refresh=lambda: p.select_variant(
+                p.load_playlist(url, jwt), url
+            )[:2]
         )
     finally:
         if server is not None:

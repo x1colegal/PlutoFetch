@@ -671,6 +671,29 @@ class Broadcaster:
                 except OSError:
                     pass
 
+
+    def close_clients(self):
+        with self.lock:
+            clients = list(self.clients)
+            self.clients.clear()
+
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+
+        if clients:
+            print(
+                f"TCP: {len(clients)} client(s) disconnected "
+                "for stream recovery",
+                flush=True
+            )
+
     def close(self):
         self.stopped.set()
         for listener in self.listeners:
@@ -994,7 +1017,10 @@ def live_loop(p, channel_id, jwt, family, port=1491):
             audio_url,
             jwt,
             server=server,
-            live=True
+            live=True,
+            refresh=lambda: p.select_variant(
+                p.load_playlist(url, jwt), url
+            )[:2]
         )
     finally:
         server.close()
