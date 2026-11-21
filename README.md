@@ -37,13 +37,13 @@ It uses Python HTTPX with HTTP/1.1 and HTTP/2 support for network requests and H
 - Download video and audio segments in parallel
 - Preserve HLS segment ordering
 - Pre-buffer media before streaming
-- Built-in H.264/AAC MPEG-TS multiplexing
+- FFmpeg-based H.264/AAC MPEG-TS remuxing
 - Support multiple simultaneous TCP clients
 - Listen on IPv4, IPv6 or both
 - Detect disconnected TCP clients
 - Record live broadcasts to fragmented MP4
 - Record and broadcast simultaneously
-- No FFmpeg required for live streaming or recording
+- FFmpeg required for live streaming and recording
 
 ### Live VOD
 
@@ -113,21 +113,29 @@ The OpenSSL command-line utility may still be required for AES-128 HLS decryptio
 ## Requirements
 
 - Python 3
-- HTTPX with HTTP/2 support (`httpx[http2]`)
-- FFmpeg (conventional VOD downloading only)
-- OpenSSL (for AES-128 HLS decryption when needed)
+- HTTPX with HTTP/2 support: `httpx[http2]`
+- FFmpeg for all video streaming, recording, and remuxing modes
+- OpenSSL executable for conventional VOD AES-128 decryption when needed
 
-HTTPX and its dependencies are required. Python's TLS implementation uses OpenSSL.
+Install HTTPX:
+
+```bash
+python3 -m pip install 'httpx[http2]'
+```
+
+The external `curl` executable is no longer required.
+HTTPS uses Python's OpenSSL-backed `ssl` module.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `PlutoFetch.py` | Main CLI, authentication and VOD downloader |
-| `PlutoFetchLive.py` | Live HLS, catalog search, MPEG-TS muxer and TCP server |
-| `PlutoFetchExtra.py` | Live MP4 recording, parallel prefetch and Live VOD |
+| `PlutoFetch.py` | CLI, authentication, HTTPX and VOD downloads |
+| `PlutoFetchLive.py` | Channel catalog and TCP broadcaster |
+| `PlutoFetchExtra.py` | Live recording and Live VOD entry points |
+| `PlutoFetchHLS.py` | Local HLS relay and FFmpeg supervisor |
 
-All three Python files must be located in the same directory.
+All four Python files must be in the same directory.
 
 ## Usage
 
@@ -183,7 +191,7 @@ With a custom directory and filename:
 
     python PlutoFetch.py -sc "Nick" --record-live --record-only -o "/sdcard/Movies" -n "Nickelodeon"
 
-This mode downloads the live HLS segments and writes a fragmented MP4 using Python. No FFmpeg or TCP server is used.
+This mode downloads the live HLS segments and writes a fragmented MP4 using Python. FFmpeg is used without opening a TCP listener.
 
 Press Ctrl+C to stop recording.
 
@@ -217,7 +225,7 @@ This mode:
 - Streams the episode in real time
 - Downloads and saves a conventional MP4 simultaneously
 - Uses FFmpeg for the conventional MP4 download
-- Uses the Python MPEG-TS multiplexer for TCP streaming
+- Uses FFmpeg to generate MPEG-TS for TCP streaming
 
 The streaming and conventional downloading paths currently perform separate HLS retrieval operations.
 
@@ -286,111 +294,111 @@ Multiple clients can connect to the TCP server simultaneously.
 
 Each client has an independent outgoing queue. Slow clients can be disconnected without blocking the other clients.
 
-## Live Buffering and Parallel Downloads
 
-PlutoFetch uses a separate prefetch worker to retrieve media ahead of transmission.
+## Live HLS Architecture
 
-The current configuration in `PlutoFetchExtra.py` is:
+Live TV and Live VOD use the following pipeline:
 
-| Setting | Value |
-|---------|-------|
-| Maximum concurrent HLS workers | 10 |
-| Initial ready-media target | 30 seconds (adaptive) |
-| Target queued-media reserve | 15 seconds (non-blocking) |
-| Maximum queued-media target | 60 seconds |
-| Live playlist polling interval | 650 ms |
+```text
+Pluto TV HLS
+     |
+     v
+Python HTTPX
+     |
+     v
+Local HLS relay (IPv6 ::1)
+     |
+     v
+FFmpeg HLS demuxer
+     |
+     v
+MPEG-TS stdout (pipe:1)
+     |
+     v
+PlutoFetch TCP broadcaster
+     |
+     v
+Local players
+```
 
-Video and audio resources can be requested concurrently.
+The relay serves rewritten playlists, HLS segments and encryption keys
+to FFmpeg. HTTPX handles all upstream Pluto TV requests.
 
-Segments are transmitted in increasing HLS media-sequence order. Previously queued or older sequence numbers are skipped to prevent old segments from being appended after newer ones.
+FFmpeg reads actual HLS playlists instead of separate raw MPEG-TS
+input pipes. Metadata such as `#EXT-X-MEDIA-SEQUENCE`,
+`#EXT-X-DISCONTINUITY`, `#EXT-X-KEY`, `#EXTINF` and
+`#EXT-X-PROGRAM-DATE-TIME` is preserved.
 
-### Buffering Behavior
+### IPv6-first relay
 
-PlutoFetch attempts to accumulate enough fully downloaded media before starting transmission.
+The relay binds to IPv6 loopback first:
 
-The initial buffering target is 30 seconds. If the source cannot provide that amount, playback may start with less buffered media after an 8-second startup fallback, provided at least 5 seconds are ready.
+```text
+http://[::1]:<automatic-port>/
+```
 
-The 15-second reserve is a target rather than a mandatory transmission gate. After startup, completed segments can be delivered even when the reserve is below its target.
+IPv4 loopback is used only if binding to `::1` fails.
 
-This prevents the internal buffering policy from indefinitely withholding available media when the source publishes segments slowly.
+The relay's HTTP port is selected automatically and is independent
+of the configurable TCP playback port.
 
-A delivery watchdog reports when no media has been delivered for 8 seconds, including the number of queued and scheduled segments.
+### Live edge delay
 
-The watchdog reports inactivity but does not automatically reconnect a failed source or TCP client.
+Live TV targets a starting position 15 seconds behind the HLS
+live edge using:
 
-For example, with 30 seconds of downloaded content:
+```text
+#EXT-X-START:TIME-OFFSET=-15.0,PRECISE=NO
+```
 
-    Downloaded:  [==============================] 30s
-    Transmitted: [===============               ] 15s
-    Reserved:                   [===============] 15s
+FFmpeg uses `-prefer_x_start 1`. The delay is a target rather
+than a continuously enforced latency.
 
-The exact amount of buffered media depends on HLS segment durations, playlist availability and download completion times.
+Live VOD starts at the beginning of the prerecorded content.
 
-The buffer settings are targets rather than guaranteed end-to-end playback latency.
+### FFmpeg logging
 
-The TCP player's own buffer is independent of PlutoFetch's internal queue.
+FFmpeg logs are displayed in the terminal, including errors involving
+timestamps, packets and HLS downloads.
 
-If the source stops publishing segments or a required download is delayed, playback may still stall.
+Periodic status reports show connected TCP clients, output bytes,
+media progress, time without output and the current FFmpeg attempt.
 
-### Segment Ordering
+### Automatic recovery
 
-Live playback follows the HLS media sequence.
+The Live supervisor monitors FFmpeg output and media progress.
 
-Example:
+It can restart the FFmpeg process, recreate the HLS relay and
+refresh the upstream HLS URLs after detected stalls or failures.
 
-    Live: segment 13
-    Live: segment 14
-    Live: segment 15
-    Live: segment 16
-    Live: segment 17
+Existing TCP clients are disconnected during recovery so they
+can reconnect with a new demuxer. The TCP listener remains active.
 
-Older sequence numbers are not reinserted after newer segments have already been queued.
+Recovery cannot guarantee uninterrupted playback and depends on
+the player's reconnection behavior.
 
-## MPEG-TS Multiplexing
+### MPEG-TS output
 
-The built-in MPEG-TS muxer combines H.264 video and AAC audio streams when they are supplied separately.
+FFmpeg remuxes the HLS media to MPEG-TS using stream copy where
+supported. PlutoFetch forwards the FFmpeg `pipe:1` output to
+connected TCP clients.
 
-It handles:
-
-- Program Association Tables (PAT)
-- Program Map Tables (PMT)
-- Packet identifiers (PIDs)
-- Continuity counters
-- PTS and DTS information
-- MPEG-TS timestamp rebasing
-
-The muxer processes MPEG-TS packets directly in Python.
-
-No FFmpeg process is used for Live TV multiplexing.
-
-### Timestamp Handling
-
-The multiplexing pipeline includes timestamp normalization intended to prevent players from displaying large inherited timestamps from the original live feed.
-
-Timestamp handling is experimental and may require additional work for unusual HLS discontinuities or timestamp resets.
+The legacy Python `TsMuxer` implementation may still exist
+in the source but is not used by the current Live entry points.
 
 ## Live MP4 Recording
 
-PlutoFetch includes a Python fragmented MP4 writer.
+Live recording uses FFmpeg to create fragmented MP4 files.
 
-The writer processes H.264 and AAC carried in MPEG-TS and generates fragmented MP4 data using ISO BMFF structures. Live recordings do not require FFmpeg.
+- `--record-live`: save MP4 while broadcasting over TCP.
+- `--record-live --record-only`: save MP4 without TCP broadcasting.
 
-The output is written incrementally while the Live TV channel continues broadcasting over TCP.
+Output directory and filename can be customized using `-o` and `-n`.
 
-Recording features include:
+If recovery restarts FFmpeg during recording, additional MP4 parts
+may be created with numbered restart suffixes.
 
-- Fragmented MP4 output
-- H.264 video
-- AAC audio
-- Automatic filenames
-- Custom filenames
-- Custom output directories
-- Recording and TCP broadcasting at the same time
-- No FFmpeg subprocess
-
-The fragmented MP4 writer is experimental.
-
-Some players may handle unfinished or interrupted recordings differently.
+FFmpeg is required for both recording modes.
 
 ## VOD Downloading
 
@@ -486,12 +494,17 @@ Cleanup options:
 
 ## Limitations
 
+Automatic recovery does not guarantee uninterrupted playback. Players may need to reconnect after FFmpeg restarts.
+
+The 15-second live-edge delay is a starting target, not a guaranteed fixed latency.
+
+
 - Pluto TV may change its APIs without notice.
 - Channel and series availability depends on region.
 - Some HLS playlist layouts may be unsupported.
 - DRM-protected streams are not supported.
-- Live MPEG-TS multiplexing is experimental.
-- Live MP4 recording is experimental.
+- Live HLS remuxing and recovery depend on FFmpeg and source stability.
+- Live MP4 recordings may be split into parts after recovery.
 - HLS discontinuities may require additional timestamp handling.
 - New TCP clients may need to wait for a decodable video keyframe.
 - Buffering cannot prevent every network or source-related stall.
