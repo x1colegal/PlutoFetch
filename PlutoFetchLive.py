@@ -111,7 +111,7 @@ def resolve_series_id(p, public_id):
     url = "https://pluto.tv/br/shows/" + public_id + "/"
     final_url = p.http_final_url(url)
     slug = urlparse(final_url).path.rstrip("/").split("/")[-1]
-    payload = catalog_json(p, "https://api.pluto.tv/v3/vod/categories?includeItems=true\&deviceType=web".replace("\\&", "&").replace("\&", "&"))
+    payload = catalog_json(p, "https://api.pluto.tv/v3/vod/categories?includeItems=true&deviceType=web".replace("\\&", "&").replace("\&", "&"))
     matches = set()
     def visit(obj):
         if isinstance(obj, list):
@@ -972,7 +972,7 @@ class FFmpegTS:
 
 
 def live_loop(p, channel_id, jwt, family, port=1491):
-    import PlutoFetchExtra as extra
+    from PlutoFetchHLS import run_hls
 
     url = urljoin(
         p.PLAYOUT_BASE,
@@ -986,36 +986,16 @@ def live_loop(p, channel_id, jwt, family, port=1491):
     print("Selected quality:", quality)
 
     server = Broadcaster(family, port)
-    remuxer = None
 
     try:
-        remuxer = FFmpegTS(
+        run_hls(
             p,
-            separate_audio=audio_url is not None,
-            server=server
+            video_url,
+            audio_url,
+            jwt,
+            server=server,
+            live=True
         )
-
-        for item, video, audio in extra._segments(
-            p, video_url, audio_url, jwt, True
-        ):
-            if p.STOP.is_set():
-                break
-
-            remuxer.submit(video, audio, item.get("duration", 5.0))
-
-            with server.lock:
-                count = len(server.clients)
-
-            print(
-                f"Live: segment {item['seq']} | "
-                f"HTTPX {len(video)/1048576:.2f} MB | "
-                f"clients {count} | "
-                f"FFmpeg TS {remuxer.bytes_out/1048576:.2f} MB",
-                flush=True
-            )
     finally:
-        try:
-            if remuxer is not None:
-                remuxer.close()
-        finally:
-            server.close()
+        server.close()
+

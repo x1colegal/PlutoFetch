@@ -517,12 +517,15 @@ def _segments(p, video_url, audio_url, jwt, follow):
 
 
 def record_channel(p, channel_id, jwt, args):
-    url = p.urljoin(
+    from PlutoFetchHLS import run_hls
+    from urllib.parse import urljoin
+
+    url = urljoin(
         p.PLAYOUT_BASE,
         f"v2/stitch/hls/channel/{channel_id}/master.m3u8"
     )
 
-    video, audio, quality = p.select_variant(
+    video_url, audio_url, quality = p.select_variant(
         p.load_playlist(url, jwt), url
     )
 
@@ -536,64 +539,47 @@ def record_channel(p, channel_id, jwt, args):
 
     server = (
         None if args.record_only
-        else live.Broadcaster(args.listen_on_ip_family, args.port)
+        else live.Broadcaster(
+            args.listen_on_ip_family,
+            args.port
+        )
     )
 
-    remuxer = None
-
     try:
-        remuxer = live.FFmpegTS(
+        run_hls(
             p,
-            separate_audio=audio is not None,
+            video_url,
+            audio_url,
+            jwt,
             server=server,
-            output=out
+            output=out,
+            live=True
         )
-
-        for item, v, a in _segments(
-            p, video, audio, jwt, True
-        ):
-            if p.STOP.is_set():
-                break
-
-            remuxer.submit(v, a, item.get("duration", 5.0))
-
-            count = 0
-            if server is not None:
-                with server.lock:
-                    count = len(server.clients)
-
-            print(
-                f"Live: segment {item['seq']} | "
-                f"clients {count} | "
-                f"FFmpeg recording {out.name}",
-                flush=True
-            )
     finally:
-        try:
-            if remuxer is not None:
-                remuxer.close()
-        finally:
-            if server is not None:
-                server.close()
+        if server is not None:
+            server.close()
 
         print("Recording:", out)
 
 
 
+
 def vod_stream(p, master, jwt, args, episode, download=None):
-    video, audio, quality = p.select_variant(
+    from PlutoFetchHLS import run_hls
+
+    video_url, audio_url, quality = p.select_variant(
         p.load_playlist(master, jwt), master
     )
 
     print("Selected quality:", quality)
 
     server = live.Broadcaster(
-        args.listen_on_ip_family, args.port
+        args.listen_on_ip_family,
+        args.port
     )
 
     errors = []
     worker = None
-    remuxer = None
 
     if download is not None:
         def task():
@@ -603,12 +589,13 @@ def vod_stream(p, master, jwt, args, episode, download=None):
                 errors.append(exc)
 
         worker = threading.Thread(
-            target=task, daemon=True
+            target=task,
+            daemon=True
         )
         worker.start()
 
     try:
-        print("VOD TCP stream: waiting for first client...")
+        print("Live VOD: waiting for TCP client...", flush=True)
 
         while not p.STOP.is_set():
             with server.lock:
@@ -619,32 +606,14 @@ def vod_stream(p, master, jwt, args, episode, download=None):
         if p.STOP.is_set():
             return
 
-        remuxer = live.FFmpegTS(
+        run_hls(
             p,
-            separate_audio=audio is not None,
-            server=server
+            video_url,
+            audio_url,
+            jwt,
+            server=server,
+            live=False
         )
-
-        for item, v, a in _segments(
-            p, video, audio, jwt, False
-        ):
-            if p.STOP.is_set():
-                break
-
-            remuxer.submit(v, a, item.get("duration", 5.0))
-
-            with server.lock:
-                count = len(server.clients)
-
-            print(
-                f"VOD Live: segment {item['seq']} | "
-                f"clients {count} | "
-                f"FFmpeg TS {remuxer.bytes_out/1048576:.2f} MB",
-                flush=True
-            )
-
-        remuxer.close()
-        remuxer = None
 
         if worker is not None:
             worker.join()
@@ -653,8 +622,5 @@ def vod_stream(p, master, jwt, args, episode, download=None):
             raise errors[0]
 
     finally:
-        try:
-            if remuxer is not None:
-                remuxer.close()
-        finally:
-            server.close()
+        server.close()
+
