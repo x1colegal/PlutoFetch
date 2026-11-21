@@ -418,7 +418,7 @@ def http_request(url, *, post=None, jwt=None,
 
         except httpx.RequestError as exc:
             error = (
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc} | URL: {url}"
             )
 
         except BaseException:
