@@ -614,8 +614,8 @@ class Broadcaster:
         while not self.stopped.is_set():
             try:
                 client, addr = listener.accept()
-                client.settimeout(2.0)
-                outgoing = queue.Queue(maxsize=64)
+                client.settimeout(15.0)
+                outgoing = queue.Queue(maxsize=512)
                 with self.lock:
                     self.clients[client] = outgoing
                 threading.Thread(target=self._sender, args=(client, outgoing), daemon=True).start()
@@ -659,6 +659,10 @@ class Broadcaster:
             try:
                 outgoing.put_nowait(data)
             except queue.Full:
+                print(
+                    "TCP client dropped: outgoing queue full",
+                    flush=True
+                )
                 # A slow client gets disconnected; never stall live output.
                 with self.lock:
                     self.clients.pop(client, None)
@@ -697,9 +701,7 @@ class FFmpegTS:
         self.output = output
         self.errors = []
         self.bytes_out = 0
-        self._pace_lock = threading.Lock()
-        self._byte_rate = 640 * 1024
-        self._pace_deadline = None
+        self.last_output = None
         self.closed = False
         self.queues = []
         self.threads = []
@@ -720,7 +722,7 @@ class FFmpegTS:
             "-loglevel", "warning",
             "-nostdin",
             "-fflags", "+genpts+discardcorrupt",
-            "-dts_delta_threshold", "1",
+            "-dts_delta_threshold", "10",
         ]
 
         for fd in self.read_fds:
@@ -800,28 +802,70 @@ class FFmpegTS:
 
     def _feed(self, fd, q):
         import os
+        import time
+
+        next_deadline = None
+        chunk_size = 188 * 128
 
         try:
             with os.fdopen(fd, "wb", buffering=0) as pipe:
                 while not self.p.STOP.is_set():
-                    block = q.get()
+                    block_info = q.get()
 
-                    if block is None:
+                    if block_info is None:
                         break
 
-                    view = memoryview(block)
+                    block, duration = block_info
+                    if not block:
+                        continue
 
-                    while view:
-                        written = pipe.write(view)
-                        if written is None or written <= 0:
-                            raise BrokenPipeError(
-                                "FFmpeg input pipe closed"
-                            )
-                        view = view[written:]
+                    duration = max(0.1, float(duration))
+                    now = time.monotonic()
+
+                    if next_deadline is None:
+                        next_deadline = now
+
+                    # Keep the input near real time.
+                    # Avoid accumulating unlimited catch-up debt.
+                    next_deadline = max(
+                        next_deadline, now - 0.25
+                    )
+
+                    total = len(block)
+                    position = 0
+
+                    while position < total:
+                        if self.p.STOP.is_set():
+                            return
+
+                        remaining = next_deadline - time.monotonic()
+
+                        if remaining > 0:
+                            if self.p.STOP.wait(remaining):
+                                return
+
+                        end = min(position + chunk_size, total)
+                        view = memoryview(block)[position:end]
+
+                        while view:
+                            written = pipe.write(view)
+                            if written is None or written <= 0:
+                                raise BrokenPipeError(
+                                    "FFmpeg input pipe closed"
+                                )
+                            view = view[written:]
+
+                        amount = end - position
+                        next_deadline += duration * amount / total
+                        position = end
 
         except (OSError, ValueError) as exc:
-            if not self.p.STOP.is_set():
+            if not self.p.STOP.is_set() and not self.closed:
                 self.errors.append(exc)
+                print(
+                    f"FFmpeg input error: {exc}",
+                    flush=True
+                )
 
     def _read_output(self):
         import time
@@ -833,46 +877,19 @@ class FFmpegTS:
                 if not block:
                     break
 
-                # Pace FFmpeg stdout instead of bursting the
-                # entire HLS prefetch buffer into the TCP queues.
-                with self._pace_lock:
-                    rate = max(1, self._byte_rate)
-
-                    now = time.monotonic()
-
-                    if self._pace_deadline is None:
-                        self._pace_deadline = now
-
-                    # Allow a small catch-up burst, never an
-                    # unlimited accumulated scheduling debt.
-                    self._pace_deadline = max(
-                        self._pace_deadline,
-                        now - 0.25
-                    )
-
-                    delay = max(
-                        0.0,
-                        self._pace_deadline - now
-                    )
-
-                    self._pace_deadline += len(block) / rate
-
-                if delay and self.p.STOP.wait(delay):
-                    break
-
+                # Input is paced by EXTINF duration.
+                # No second, bitrate-based output throttle.
                 if self.server is not None:
                     self.server.publish(block)
 
                 self.bytes_out += len(block)
+                self.last_output = time.monotonic()
 
         except (OSError, ValueError) as exc:
-            if not self.p.STOP.is_set():
+            if not self.p.STOP.is_set() and not self.closed:
                 self.errors.append(exc)
-
-        finally:
-            if self.process.poll() is None and not self.closed:
                 print(
-                    "FFmpeg stdout reader stopped",
+                    f"FFmpeg output error: {exc}",
                     flush=True
                 )
 
@@ -892,20 +909,6 @@ class FFmpegTS:
         import queue
 
         duration = max(0.1, float(duration))
-        size = len(video) + (len(audio) if audio else 0)
-
-        # Estimate the actual stream bitrate from the
-        # downloaded HLS media and EXTINF duration.
-        measured = size / duration
-
-        with self._pace_lock:
-            if self.bytes_out == 0:
-                self._byte_rate = measured
-            else:
-                self._byte_rate = (
-                    self._byte_rate * 0.75
-                    + measured * 0.25
-                )
 
         blocks = [video]
 
@@ -919,8 +922,12 @@ class FFmpegTS:
         for q, block in zip(self.queues, blocks):
             while not self.p.STOP.is_set():
                 self.check()
+
                 try:
-                    q.put(block, timeout=0.5)
+                    q.put(
+                        (block, duration),
+                        timeout=0.5
+                    )
                     break
                 except queue.Full:
                     continue
