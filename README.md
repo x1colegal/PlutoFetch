@@ -525,3 +525,34 @@ Users are responsible for complying with applicable copyright laws, licensing re
 This project is licensed under the MIT License.
 
 See [LICENSE](LICENSE) for details.
+
+
+### Independent playback per TCP client
+
+By default, Live VOD uses one shared playback timeline.
+All connected TCP clients receive the same current position.
+
+Add `--live-vod-per-client` to give each TCP client its own
+playback session starting at the beginning of the episode.
+
+Example:
+
+    python3 PlutoFetch.py -s "Bob Esponja" --live-vod only --live-vod-per-client
+
+With simultaneous MP4 downloading:
+
+    python3 PlutoFetch.py -s "Bob Esponja" --live-vod both --live-vod-per-client
+
+Behavior:
+
+- Every new TCP connection starts at 00:00.
+- Each client has its own FFmpeg process and HLS relay.
+- Clients can be at different positions in the same episode.
+- Disconnecting a client stops only its playback process.
+- Finishing an episode does not stop the TCP listener.
+- The normal shared Live VOD mode remains available.
+- The local HLS relay prefers IPv6 `::1`.
+
+Independent playback consumes additional CPU, memory and
+HTTP bandwidth for each connected client.
+

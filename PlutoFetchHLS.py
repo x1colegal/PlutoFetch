@@ -241,17 +241,26 @@ class HLSRelay:
 
 def run_hls(p, video_url, audio_url, jwt,
             server=None, output=None, live=True,
-            refresh=None):
+            refresh=None, stop_event=None):
     """
     HTTPX HLS relay -> FFmpeg -> stdout -> local TCP.
 
     Live mode supervises the FFmpeg process and recovers from
     stalled output, stalled media timestamps or unexpected exit.
     """
+    def stopping():
+        return (
+            p.STOP.is_set()
+            or (
+                stop_event is not None
+                and stop_event.is_set()
+            )
+        )
+
     attempt = 0
     total_bytes = 0
 
-    while not p.STOP.is_set():
+    while not stopping():
         attempt += 1
 
         if attempt > 1 and refresh is not None:
@@ -482,7 +491,7 @@ def run_hls(p, video_url, audio_url, jwt,
 
             last_report = 0.0
 
-            while not p.STOP.is_set():
+            while not stopping():
                 now = time.monotonic()
                 code = process.poll()
 
@@ -575,7 +584,7 @@ def run_hls(p, video_url, audio_url, jwt,
 
             relay.close()
 
-        if p.STOP.is_set():
+        if stopping():
             break
 
         if restart_reason is None:

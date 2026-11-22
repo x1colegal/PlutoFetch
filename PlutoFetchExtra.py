@@ -567,6 +567,193 @@ def record_channel(p, channel_id, jwt, args):
 
 
 
+
+class PerClientVODServer(live.Broadcaster):
+    """One independent HLS/FFmpeg playback for each TCP client."""
+
+    def __init__(self, p, video_url, audio_url,
+                 jwt, family, port):
+        self.p = p
+        self.video_url = video_url
+        self.audio_url = audio_url
+        self.jwt = jwt
+        self.sessions = {}
+        super().__init__(family, port)
+
+    def _accept(self, listener):
+        import socket
+
+        while (
+            not self.stopped.is_set()
+            and not self.p.STOP.is_set()
+        ):
+            try:
+                client, addr = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            client.settimeout(5.0)
+            stopped = threading.Event()
+
+            with self.lock:
+                self.clients[client] = None
+                self.sessions[client] = stopped
+                count = len(self.clients)
+
+            print(
+                f"[Live VOD] Client connected: {addr[0]} | "
+                f"clients {count} | starting at 00:00",
+                flush=True
+            )
+
+            threading.Thread(
+                target=self._play_client,
+                args=(client, stopped),
+                daemon=True,
+                name="pluto-vod-client"
+            ).start()
+
+    def _play_client(self, client, stopped):
+        import select
+        import socket
+        from PlutoFetchHLS import run_hls
+
+        parent = self
+
+        class ClientOutput:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.clients = {client: None}
+
+            def publish(self, data):
+                try:
+                    client.sendall(data)
+                except (OSError, ValueError):
+                    stopped.set()
+                    raise
+
+        def watch_disconnect():
+            while (
+                not stopped.wait(0.5)
+                and not parent.p.STOP.is_set()
+            ):
+                try:
+                    ready, _, _ = select.select(
+                        [client], [], [], 0
+                    )
+
+                    if ready:
+                        data = client.recv(
+                            1, socket.MSG_PEEK
+                        )
+                        if not data:
+                            stopped.set()
+                            return
+
+                except (OSError, ValueError):
+                    stopped.set()
+                    return
+
+        watcher = threading.Thread(
+            target=watch_disconnect,
+            daemon=True,
+            name="pluto-vod-disconnect"
+        )
+        watcher.start()
+
+        try:
+            run_hls(
+                self.p,
+                self.video_url,
+                self.audio_url,
+                self.jwt,
+                server=ClientOutput(),
+                live=False,
+                stop_event=stopped
+            )
+
+        except Exception as exc:
+            if not stopped.is_set() and not self.p.STOP.is_set():
+                print(
+                    f"[Live VOD] Client playback failed: {exc}",
+                    flush=True
+                )
+
+        finally:
+            stopped.set()
+
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+            try:
+                client.close()
+            except OSError:
+                pass
+
+            with self.lock:
+                self.clients.pop(client, None)
+                self.sessions.pop(client, None)
+                count = len(self.clients)
+
+            print(
+                f"[Live VOD] Client finished | "
+                f"clients {count}",
+                flush=True
+            )
+
+    def close(self):
+        if hasattr(self, "sessions"):
+            with self.lock:
+                sessions = list(self.sessions.values())
+
+            for stopped in sessions:
+                stopped.set()
+
+        super().close()
+
+
+def vod_stream_independent(
+    p, video_url, audio_url, jwt, args, download
+):
+    server = PerClientVODServer(
+        p, video_url, audio_url, jwt,
+        args.listen_on_ip_family,
+        args.port
+    )
+
+    errors = []
+
+    if download is not None:
+        def download_task():
+            try:
+                download()
+            except Exception as exc:
+                errors.append(exc)
+
+        threading.Thread(
+            target=download_task,
+            daemon=True,
+            name="pluto-vod-download"
+        ).start()
+
+    print(
+        "[Live VOD] Per-client playback enabled. "
+        "Each TCP connection starts at 00:00.",
+        flush=True
+    )
+
+    try:
+        while not p.STOP.wait(0.5):
+            if errors:
+                raise errors[0]
+    finally:
+        server.close()
+
+
 def vod_stream(p, master, jwt, args, episode, download=None):
     from PlutoFetchHLS import run_hls
 
@@ -575,6 +762,11 @@ def vod_stream(p, master, jwt, args, episode, download=None):
     )
 
     print("Selected quality:", quality)
+
+    if getattr(args, "live_vod_per_client", False):
+        return vod_stream_independent(
+            p, video, audio, jwt, args, download
+        )
 
     server = live.Broadcaster(
         args.listen_on_ip_family,

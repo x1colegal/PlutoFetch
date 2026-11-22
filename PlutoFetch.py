@@ -74,6 +74,11 @@ def parse_args():
     p.add_argument("--record-live", action="store_true", help="Save Live TV to fragmented MP4 using FFmpeg while broadcasting TCP")
     p.add_argument("--live-vod", choices=("both", "only"), help="Pace VOD over TCP: both = stream + save MP4, only = stream only")
 
+    p.add_argument(
+        "--live-vod-per-client",
+        action="store_true",
+        help="Start Live VOD at 00:00 for each TCP client"
+    )
     cleanup = p.add_mutually_exclusive_group()
     cleanup.add_argument("-k", action="store_true",
                          help="Keep all temporary files")
@@ -89,6 +94,9 @@ def parse_args():
     p.add_argument("-o", "--output", help="Final output directory")
     p.add_argument("--include-filler", action="store_true", help="Include Pluto TV trailing bumpers")
     args = p.parse_args()
+
+    if args.live_vod_per_client and not args.live_vod:
+        p.error("--live-vod-per-client requires --live-vod")
 
     if not 1 <= args.port <= 65535:
         p.error("Port must be between 1 and 65535")
